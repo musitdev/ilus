@@ -1,6 +1,7 @@
 //! Conditions: detect situations on their input (spec F2).
 
 pub mod divergence;
+pub mod patterns;
 
 use crate::error::ModifierError;
 use crate::modifier::ModifierValue;

@@ -268,7 +268,7 @@ struct Executor { /* graph, tick, clock */ }
 **General rules:**
 - A pattern is only checked once its last candle has **closed**. A trigger is never emitted for a candle still in progress, and once emitted it is never withdrawn.
 - A given pattern triggers at most once per candle.
-- Multiple patterns can match the same candle. Since a condition emits one event at a time, see Open questions for how this is resolved.
+- Multiple patterns can match the same candle: the condition emits **one detection listing every match**, in table order; its event type is the first match. A condition can watch only some patterns (`only(&[...])`, e.g. one condition per pattern) or one signal (modifier `WatchOnly(Bullish | Bearish)`).
 - Detection starts only once enough closed candles exist to compute the averages (`AVG_LEN`) and the trend reference used by the pattern.
 
 **Candle measures** — computed on a closed candle with open `O`, high `H`, low `L`, close `C`:
@@ -283,6 +283,8 @@ struct Executor { /* graph, tick, clock */ }
 - **Equality tolerance**: two values are considered equal when they differ by less than `EPSILON × price`, so that exact threshold hits are handled consistently.
 
 **Threshold sets:** candlestick definitions vary between authors and tools, so ilus is designed to support **several threshold sets** (e.g. strict, loose, author-specific). For now only one set is defined: `default`, holding the most commonly used values below. The implementation must keep thresholds as data (not hard-coded in pattern logic) so that new sets can be added without changing pattern code.
+
+In code: `PatternCondition::new(ThresholdSet::default())`; a single value can be overridden (`ThresholdSet { long_shadow: dec!(3), ..Default::default() }`), and a set can be replaced while running with the modifier `SetThresholds` (except `AVG_LEN` and `TREND_LEN`, which size the history). Warm-up: `TREND_LEN + 3` candles (trend defined on the candle preceding a 3-candle pattern).
 
 **Default threshold set (`default`):**
 
@@ -605,9 +607,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 ## 12. Open questions
 - F6: pivots use the candle low/high. Should closes be an option?
 - F6: should "hidden" divergences (trend continuation: higher price low with lower RSI low) be detected too?
-- How does a pattern condition select a threshold set in code (e.g. `ThresholdSet::default()`)? Can individual values be overridden per condition? → to decide during development.
 - Which additional threshold sets to define later, and from which sources? → later.
 - ~~Value of N~~ → resolved: 5 retries with exponential backoff (1 s → 60 s).
-- If several patterns match the same candle in one condition, which event is emitted: the first by table order, one event listing all matches, or one condition instance per pattern?
 - Modifier senders: "mostly by actions". Who else can send them: other conditions, an external command (CLI), a timer?
 - RSI: confirm defaults (`period` 14, on close, Wilder smoothing) and the rounding of the output.

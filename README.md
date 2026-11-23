@@ -107,6 +107,11 @@ Key properties:
   - `Chart` (feature `chart`): shows candles, RSI and trade markers in a native
     window.
 - **Conditions**
+  - `PatternCondition`: the 13 classic candlestick patterns (engulfing,
+    hammer, hanging man, inverted hammer, shooting star, doji, morning and
+    evening star, harami, piercing line, dark cloud cover), with a default
+    threshold set that can be overridden. Several patterns matching the same
+    candle are reported in one detection.
   - `RsiDivergence`: detects divergences between price and RSI:
     - *bullish*: price makes a lower low while RSI makes a higher low;
     - *bearish*: price makes a higher high while RSI makes a lower high.
@@ -119,9 +124,6 @@ Key properties:
 Splitting a source needs no special entity: one output can feed several
 consumers (fan-out). A transformer or a condition never processes the same
 value twice.
-
-Planned in the spec but not implemented yet: the 13 candlestick pattern
-conditions (spec F0).
 
 ---
 
@@ -206,11 +208,13 @@ cargo run --example flow_modes
 | `binance_sol_rsi` | SOL/USDT 1m → RSI(14); prints every candle with its RSI (the bootstrap candles first), and alerts on live candles when RSI < 30 or > 70. |
 | `rsi_divergence` | SOL/USDT 1m → RSI(14) → divergence detection; prints each divergence detected on the live feed. |
 | `merge_rsi` | SOL/USDT 15m + 1h merged, with an RSI on each timeframe; prints when RSI 15m < 30 and RSI 1h < 40 (replay of the last days). |
+| `candle_patterns` | The 13 candlestick patterns on SOL/USDT history; prints each candle with its patterns, then a count per pattern. |
 
 ```sh
 cargo run --example binance_sol_rsi     # Ctrl+C to stop
 cargo run --example rsi_divergence      # Ctrl+C to stop
 cargo run --example merge_rsi -- 7      # last 7 days
+cargo run --example candle_patterns -- 3 15m   # last 3 days, 15m
 ```
 
 ### Backtests on Binance history
@@ -299,6 +303,7 @@ src/
   transformer/chart.rs chart transformer + window (feature `chart`)
   condition.rs        Condition trait
   condition/divergence.rs  RSI divergence condition
+  condition/patterns.rs    candlestick pattern condition (13 patterns)
   trigger.rs          Detection, TriggerEvent
   action.rs           Action trait, ActionContext, Alert
   modifier.rs         modifiers and handles
