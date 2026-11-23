@@ -49,11 +49,11 @@ fn replay(values: &[i64]) -> MockSource<IndicatorPoint> {
     MockSource::replay("T", Timeframe::M1, points(values))
 }
 
-async fn run(g: Graph) {
+fn run(g: Graph) {
     Executor::new(g)
         .with_clock(Clock::Simulated(epoch()))
         .run()
-        .await;
+        .unwrap();
 }
 
 /// Items carrying a value.
@@ -181,7 +181,7 @@ struct Record<I> {
     with_time: bool,
     to_condition: Option<(ModifierHandle<SetThreshold>, Vec<SetThreshold>)>,
     to_transformer: Option<(ModifierHandle<SetFactor>, Decimal)>,
-    awaits: bool,
+    blocks: bool,
     fail: bool,
     input: PhantomData<fn(I)>,
 }
@@ -193,7 +193,7 @@ fn record<I>(name: &'static str, log: &Log) -> Record<I> {
         with_time: false,
         to_condition: None,
         to_transformer: None,
-        awaits: false,
+        blocks: false,
         fail: false,
         input: PhantomData,
     }
@@ -203,7 +203,7 @@ impl<I: Val> Action for Record<I> {
     type Value = Hit;
     type Input = I;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Hit, I>,
         ctx: &mut ActionContext,
@@ -212,10 +212,9 @@ impl<I: Val> Action for Record<I> {
         if self.with_time {
             entry += &format!(":{}", ctx.now().format("%H:%M:%S"));
         }
-        if self.awaits {
+        if self.blocks {
             log(&self.log, format!("{}:start", self.name));
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         log(&self.log, entry);
         if let Some((to, modifiers)) = self.to_condition.take() {
@@ -235,8 +234,8 @@ impl<I: Val> Action for Record<I> {
 
 // ------------------------------------------------------------------- tests
 
-#[tokio::test]
-async fn nodes_run_in_graph_order_with_fan_out() {
+#[test]
+fn nodes_run_in_graph_order_with_fan_out() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[1, 2]));
@@ -245,7 +244,7 @@ async fn nodes_run_in_graph_order_with_fan_out() {
     let c2 = g.condition("c2", at_least("c2", dec!(0), 0, &l), &t);
     g.action(record("a1", &l), &c1);
     g.action(record("a2", &l), &c2);
-    run(g).await;
+    run(g);
     // Per tick: transformer once, both conditions, then the actions.
     assert_eq!(
         entries(&l),
@@ -264,14 +263,14 @@ async fn nodes_run_in_graph_order_with_fan_out() {
     );
 }
 
-#[tokio::test]
-async fn bootstrap_items_warm_up_without_action_events() {
+#[test]
+fn bootstrap_items_warm_up_without_action_events() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[0, 1, 2, 3, 4]));
     let c = g.condition("c", at_least("c", dec!(0), 2, &l), &src); // warm-up 2
     g.action(record("a", &l), &c);
-    run(g).await;
+    run(g);
     assert_eq!(
         entries(&l),
         [
@@ -287,8 +286,8 @@ async fn bootstrap_items_warm_up_without_action_events() {
     );
 }
 
-#[tokio::test]
-async fn bootstrap_length_is_the_max_over_paths_of_summed_warm_ups() {
+#[test]
+fn bootstrap_length_is_the_max_over_paths_of_summed_warm_ups() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[0, 1, 2, 3, 4, 5, 6, 7]));
@@ -298,14 +297,14 @@ async fn bootstrap_length_is_the_max_over_paths_of_summed_warm_ups() {
     let c2 = g.condition("c2", at_least("c2", dec!(0), 4, &l), &src);
     g.action(record("a1", &l), &c1);
     g.action(record("a2", &l), &c2);
-    run(g).await;
+    run(g);
     let first_event = |a: &str| entries(&l).into_iter().find(|e| e.starts_with(a)).unwrap();
     assert_eq!(first_event("a1:"), "a1:5:Replay");
     assert_eq!(first_event("a2:"), "a2:5:Replay");
 }
 
-#[tokio::test]
-async fn modifiers_are_applied_at_the_end_of_the_tick_in_send_order() {
+#[test]
+fn modifiers_are_applied_at_the_end_of_the_tick_in_send_order() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[1, 2, 3, 4, 5]));
@@ -321,7 +320,7 @@ async fn modifiers_are_applied_at_the_end_of_the_tick_in_send_order() {
         ],
     ));
     g.action(a, &c);
-    run(g).await;
+    run(g);
     let events: Vec<String> = entries(&l)
         .into_iter()
         .filter(|e| e.starts_with("a:"))
@@ -330,8 +329,8 @@ async fn modifiers_are_applied_at_the_end_of_the_tick_in_send_order() {
     assert_eq!(events, ["a:1:Replay", "a:4:Replay", "a:5:Replay"]);
 }
 
-#[tokio::test]
-async fn actions_can_modify_a_transformer() {
+#[test]
+fn actions_can_modify_a_transformer() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[1, 2, 3]));
@@ -340,7 +339,7 @@ async fn actions_can_modify_a_transformer() {
     let mut a = record("a", &l);
     a.to_transformer = Some((g.modifier_handle(&t), dec!(10)));
     g.action(a, &c);
-    run(g).await;
+    run(g);
     let t_values: Vec<String> = entries(&l)
         .into_iter()
         .filter(|e| e.starts_with("t:"))
@@ -348,31 +347,32 @@ async fn actions_can_modify_a_transformer() {
     assert_eq!(t_values, ["t:1", "t:20", "t:30"]);
 }
 
-#[tokio::test]
-async fn sources_in_replay_are_called_one_after_the_other_each_tick() {
+#[test]
+fn sources_in_replay_are_called_one_after_the_other_each_tick() {
     let l = Log::default();
     let mut g = Graph::new();
     let a = g.source(replay(&[1, 2, 3]));
     let b = g.source(replay(&[10]));
     g.condition("ca", at_least("ca", dec!(1000), 0, &l), &a);
     g.condition("cb", at_least("cb", dec!(1000), 0, &l), &b);
-    run(g).await;
+    run(g);
     assert_eq!(
         entries(&l),
         ["ca:1:Replay", "cb:10:Replay", "ca:2:Replay", "ca:3:Replay"]
     );
 }
 
-#[tokio::test]
-async fn actions_are_awaited_within_the_tick() {
+#[test]
+fn a_blocking_action_delays_the_tick() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[1, 2]));
     let c = g.condition("c", at_least("c", dec!(0), 0, &l), &src);
     let mut a = record("a", &l);
-    a.awaits = true;
+    a.blocks = true;
     g.action(a, &c);
-    run(g).await;
+    run(g);
+    // The next candle is processed only after the action has returned.
     assert_eq!(
         entries(&l),
         [
@@ -386,8 +386,65 @@ async fn actions_are_awaited_within_the_tick() {
     );
 }
 
-#[tokio::test]
-async fn failing_action_does_not_stop_the_tick() {
+/// Starts async work on the first event; the work sends a modifier back.
+struct Background {
+    condition: ModifierHandle<SetThreshold>,
+    started: bool,
+}
+
+impl Action for Background {
+    type Value = Hit;
+    type Input = IndicatorPoint;
+
+    fn run(
+        &mut self,
+        _event: TriggerEvent<'_, Hit, IndicatorPoint>,
+        ctx: &mut ActionContext,
+    ) -> Result<(), ActionError> {
+        if !std::mem::replace(&mut self.started, true) {
+            let reply = ctx.deferred(&self.condition);
+            ctx.spawn(async move {
+                // e.g. an order sent over the network
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let _ = reply.send(SetThreshold::To(dec!(1000)));
+            });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn async_work_runs_on_the_runtime_and_reports_with_a_deferred_modifier() {
+    let l = Log::default();
+    let mut g = Graph::new();
+    // Real clock and 10 ms ticks, so that the async work has time to finish.
+    let src = g.source(replay(&(1..=30).collect::<Vec<_>>()));
+    let c = g.condition("c", at_least("c", dec!(0), 0, &l), &src);
+    let handle = g.modifier_handle(&c);
+    g.action(
+        Background {
+            condition: handle,
+            started: false,
+        },
+        &c,
+    );
+    g.action(record("a", &l), &c);
+    Executor::new(g).run().unwrap();
+    let events: Vec<String> = entries(&l)
+        .into_iter()
+        .filter(|e| e.starts_with("a:"))
+        .collect();
+    // The first ticks trigger; once the async reply is applied (threshold
+    // 1000), nothing triggers any more.
+    assert!(!events.is_empty(), "the first tick triggers");
+    assert!(
+        events.len() < 30,
+        "the deferred modifier was applied: {events:?}"
+    );
+}
+
+#[test]
+fn failing_action_does_not_stop_the_tick() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(replay(&[1, 2]));
@@ -396,7 +453,7 @@ async fn failing_action_does_not_stop_the_tick() {
     a1.fail = true;
     g.action(a1, &c);
     g.action(record("a2", &l), &c);
-    run(g).await;
+    run(g);
     let events: Vec<String> = entries(&l)
         .into_iter()
         .filter(|e| e.starts_with('a'))
@@ -407,8 +464,8 @@ async fn failing_action_does_not_stop_the_tick() {
     );
 }
 
-#[tokio::test]
-async fn normal_mode_is_called_just_after_each_candle_close() {
+#[test]
+fn normal_mode_is_called_just_after_each_candle_close() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(MockSource::live("T", Timeframe::M1, points(&[1, 2, 3])));
@@ -416,7 +473,7 @@ async fn normal_mode_is_called_just_after_each_candle_close() {
     let mut a = record("a", &l);
     a.with_time = true;
     g.action(a, &c);
-    run(g).await;
+    run(g);
     let events: Vec<String> = entries(&l)
         .into_iter()
         .filter(|e| e.starts_with("a:"))
@@ -432,23 +489,23 @@ async fn normal_mode_is_called_just_after_each_candle_close() {
     );
 }
 
-#[tokio::test]
-async fn bootstrap_then_normal_mode() {
+#[test]
+fn bootstrap_then_normal_mode() {
     let l = Log::default();
     let mut g = Graph::new();
     let src = g.source(MockSource::live("T", Timeframe::M1, points(&[1, 2, 3])).with_bootstrap(2));
     let c = g.condition("c", at_least("c", dec!(0), 0, &l), &src);
     g.action(record("a", &l), &c);
-    run(g).await;
+    run(g);
     assert_eq!(
         entries(&l),
         ["c:1:Bootstrap", "c:2:Bootstrap", "c:3:Normal", "a:3:Normal"]
     );
 }
 
-#[tokio::test]
-async fn replay_is_deterministic() {
-    async fn once() -> Vec<String> {
+#[test]
+fn replay_is_deterministic() {
+    fn once() -> Vec<String> {
         let l = Log::default();
         let mut g = Graph::new();
         let src = g.source(replay(&[3, 1, 4, 1, 5, 9, 2, 6]));
@@ -457,17 +514,17 @@ async fn replay_is_deterministic() {
         let mut a = record("a", &l);
         a.to_condition = Some((g.modifier_handle(&c), vec![SetThreshold::To(dec!(5))]));
         g.action(a, &c);
-        run(g).await;
+        run(g);
         entries(&l)
     }
-    let first = once().await;
+    let first = once();
     for _ in 0..5 {
-        assert_eq!(once().await, first);
+        assert_eq!(once(), first);
     }
 }
 
-#[tokio::test]
-async fn a_node_never_processes_the_same_item_twice() {
+#[test]
+fn a_node_never_processes_the_same_item_twice() {
     let l = Log::default();
     let mut g = Graph::new();
     // Items at 00:00, 00:00 (same time again), 00:01.
@@ -476,7 +533,7 @@ async fn a_node_never_processes_the_same_item_twice() {
     let src = g.source(MockSource::replay("T", Timeframe::M1, items));
     let t = g.transform(scale("t", 0, &l), &src);
     g.condition("c", at_least("c", dec!(1000), 0, &l), &t);
-    run(g).await;
+    run(g);
     assert_eq!(entries(&l), ["t:1", "c:1:Replay", "t:3", "c:3:Replay"]);
 }
 
@@ -538,8 +595,8 @@ mod merge {
             .collect()
     }
 
-    #[tokio::test]
-    async fn merged_source_feeds_a_combined_transformer() {
+    #[test]
+    fn merged_source_feeds_a_combined_transformer() {
         let l = Log::default();
         let mut g = Graph::new();
         let merged = g.source(MergeSource::new(
@@ -551,7 +608,7 @@ mod merge {
             &merged,
         );
         g.condition("pairs", LogPair(l.clone()), &both);
-        run(g).await;
+        run(g);
         // Values are the minutes of each item; the 1h one changes only when
         // a new 1h candle is closed (no look-ahead).
         assert_eq!(
@@ -568,4 +625,12 @@ mod merge {
             ]
         );
     }
+}
+
+#[tokio::test]
+async fn run_from_an_async_task_is_an_error() {
+    let mut g = Graph::new();
+    g.source(replay(&[1]));
+    let result = Executor::new(g).with_clock(Clock::Simulated(epoch())).run();
+    assert!(result.is_err(), "the executor must run on its own thread");
 }

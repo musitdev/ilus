@@ -58,7 +58,7 @@ pub struct Detection<V> {
 }
 
 /// Event given to an action when its condition triggers (never for bootstrap
-/// items). The action is awaited within the tick, so the event borrows the
+/// items). The action runs within the tick, so the event borrows the
 /// detection value and the triggering item.
 #[derive(Debug)]
 pub struct TriggerEvent<'a, V, D> {

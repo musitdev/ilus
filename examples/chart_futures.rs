@@ -93,11 +93,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &signals,
     );
 
-    // The executor runs in the background; the window owns the main thread.
+    // The executor runs on its own thread; the window owns the main thread.
     let executor = Executor::new(g).with_tick(args.tick);
-    std::thread::spawn(move || match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt.block_on(executor.run()),
-        Err(e) => eprintln!("cannot start the runtime: {e}"),
+    std::thread::spawn(move || {
+        if let Err(e) = executor.run() {
+            eprintln!("cannot start the executor: {e}");
+        }
     });
     window.run()?;
     Ok(())

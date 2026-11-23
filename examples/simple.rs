@@ -91,7 +91,7 @@ impl Action for RaiseThreshold {
     type Value = CloseSignal;
     type Input = Candle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, CloseSignal, Candle>,
         ctx: &mut ActionContext,
@@ -174,8 +174,7 @@ impl Condition for SmaAbove {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     let btc = g.source(common::replay(
         "BTCUSDT",
@@ -216,5 +215,6 @@ async fn main() {
     );
     g.action(Alert::new(), &sma_above);
 
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
+    Ok(())
 }

@@ -50,8 +50,7 @@ use ilus::source::binance::BinanceSource;
 use ilus::transformer::rsi::Rsi;
 use rust_decimal::Decimal;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     println!("{}", args.header);
 
@@ -69,6 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &signals,
         );
     }
-    Executor::new(g).with_tick(args.tick).run().await;
+    Executor::new(g).with_tick(args.tick).run()?;
     Ok(())
 }

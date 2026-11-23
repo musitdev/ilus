@@ -23,7 +23,7 @@ agents is in [`AGENTS.md`](AGENTS.md).
 | **Source** | Produces closed data items (e.g. Binance candles for one asset and one timeframe). Each item carries the source's **running mode**. |
 | **Transformer** | Turns one input into a new output (e.g. candles → candles + RSI). It **always forwards its input**, adding a computed value (`None` while it warms up). Transformers can be chained. |
 | **Condition** | Reads one input and emits a **detection** when it sees its situation (e.g. a bullish divergence). |
-| **Action** | Reacts to the detections of **one** condition (print, simulate a trade, …). It can keep state and can be async. |
+| **Action** | Reacts to the detections of **one** condition (print, simulate a trade, …). It can keep state; network work (orders, webhooks) is started on the async runtime. |
 | **Modifier** | A message sent (usually by an action) to a condition or a transformer to change how it works, e.g. "switch threshold" or "draw this trade marker". |
 | **Graph** | The entities and their links, built in Rust code with a typed builder. |
 | **Executor** | Runs the graph, tick by tick. |
@@ -40,7 +40,7 @@ The executor runs **ticks**. A tick is fully sequential:
 
 1. call the due sources (each returns zero or one new item);
 2. run the transformers and conditions fed by the new items, in graph order;
-3. run the actions of the conditions that triggered, awaiting each one;
+3. run the actions of the conditions that triggered;
 4. apply the modifiers produced during the tick;
 5. wait for the next tick.
 
@@ -57,6 +57,15 @@ A source always starts with **bootstrap**, then goes to **normal** (live) or to
 from the graph: each transformer and condition declares its warm-up, and each
 source bootstraps the largest total warm-up found along the paths downstream
 of it.
+
+Two kinds of threads, never mixed:
+
+- the **executor thread** (the one calling `Executor::run`) runs the ticks:
+  sources' calls, transformers, conditions and actions, all sync. A slow
+  entity only makes the tick longer;
+- an **async runtime** owned by the executor, on its own threads, runs the
+  network work: sources' fetches, and orders or webhooks started by actions
+  (`ActionContext::spawn`). Their results come back as modifiers.
 
 Key properties:
 
@@ -136,8 +145,7 @@ use ilus::source::Timeframe;
 use ilus::source::binance::BinanceSource;
 use ilus::transformer::rsi::Rsi;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
 
     // Source: SOL/USDT 15-minute candles (bootstrap, then live).
@@ -152,7 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     g.action(Alert::new(), &divergence);
 
-    Executor::new(g).run().await;
+    // Blocking: runs the ticks on this thread (async work on its own threads).
+    Executor::new(g).run()?;
     Ok(())
 }
 ```
@@ -173,7 +182,7 @@ through the graph.
 | `simple` | Every building block together: one source feeding two branches (fan-out), a transformer (SMA), and an action that sends a modifier back to its condition. |
 | `flow_chain` | A chain source → transformer → transformer → condition within one tick; bootstrap items go through the chain without action events. |
 | `flow_modifier` | The action → modifier → condition loop (the condition switches between oversold and overbought); the modifier is applied before the next candle; an invalid one is rejected. |
-| `flow_slow_action` | A slow async action makes the tick longer: nothing is queued, nothing is lost; a failing action does not stop the next tick. |
+| `flow_slow_action` | A slow (blocking) action makes the tick longer: nothing is queued, nothing is lost; a failing action does not stop the next tick. |
 | `flow_parallel` | Two sources in one graph: one item each per tick, called one after the other. |
 | `flow_modes` | Bootstrap, then normal (live) mode with calls just after each candle close (simulated clock, instant). |
 

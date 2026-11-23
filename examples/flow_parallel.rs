@@ -59,8 +59,7 @@ impl Condition for Above {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     let fast = g.source(common::replay("FAST", &[1, 2, 3, 4, 5, 6, 7, 8]));
     let slow = g.source(common::replay("SLOW", &[100, 200, 300]));
@@ -84,6 +83,7 @@ async fn main() {
     g.action(LogAction::new("action"), &fast_above);
     g.action(LogAction::new("action"), &slow_above);
 
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
     log("main", "executor stopped: all sources ended");
+    Ok(())
 }

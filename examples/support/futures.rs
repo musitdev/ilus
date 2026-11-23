@@ -386,7 +386,7 @@ impl<R: TradeRecorder> Action for Futures<R> {
     type Value = Signal;
     type Input = RsiCandle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Signal, RsiCandle>,
         ctx: &mut ActionContext,

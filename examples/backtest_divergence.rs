@@ -85,7 +85,7 @@ impl Action for Simulator {
     type Value = Divergence;
     type Input = RsiCandle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Divergence, RsiCandle>,
         _ctx: &mut ActionContext,
@@ -187,8 +187,7 @@ impl Drop for Simulator {
 }
 
 /// Parse a timeframe argument (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`).
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arguments: optional `--days N`, optional timeframe, then fees in %.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut days: i64 = 1;
@@ -243,7 +242,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Replay as fast as possible.
     Executor::new(g)
         .with_tick(std::time::Duration::ZERO)
-        .run()
-        .await;
+        .run()?;
     Ok(())
 }

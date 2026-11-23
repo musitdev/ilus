@@ -15,7 +15,6 @@
 use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
-use std::pin::Pin;
 
 use chrono::{DateTime, Utc};
 
@@ -233,9 +232,6 @@ impl<C: Condition> DynProc for ConditionNode<C> {
     }
 }
 
-pub(crate) type ActionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), ActionError>> + Send + 'a>>;
-
 /// What an action receives from the executor.
 pub(crate) struct ActionInput<'a> {
     pub(crate) detection: &'a (dyn Any + Send),
@@ -248,11 +244,7 @@ pub(crate) struct ActionInput<'a> {
 
 pub(crate) trait DynAction: Send {
     fn condition(&self) -> usize;
-    fn run<'a>(
-        &'a mut self,
-        input: ActionInput<'a>,
-        ctx: &'a mut ActionContext,
-    ) -> ActionFuture<'a>;
+    fn run(&mut self, input: ActionInput<'_>, ctx: &mut ActionContext) -> Result<(), ActionError>;
 }
 
 struct ActionNode<A> {
@@ -264,19 +256,13 @@ impl<A: Action> DynAction for ActionNode<A> {
     fn condition(&self) -> usize {
         self.condition
     }
-    fn run<'a>(
-        &'a mut self,
-        input: ActionInput<'a>,
-        ctx: &'a mut ActionContext,
-    ) -> ActionFuture<'a> {
+    fn run(&mut self, input: ActionInput<'_>, ctx: &mut ActionContext) -> Result<(), ActionError> {
         let detection = input.detection.downcast_ref::<Detection<A::Value>>();
         let data = input.data.downcast_ref::<A::Input>();
         let (Some(detection), Some(data)) = (detection, data) else {
-            return Box::pin(async {
-                Err(ActionError::Failed(
-                    "event of the wrong type (internal error)".into(),
-                ))
-            });
+            return Err(ActionError::Failed(
+                "event of the wrong type (internal error)".into(),
+            ));
         };
         let event = TriggerEvent {
             condition: input.condition,
@@ -287,7 +273,7 @@ impl<A: Action> DynAction for ActionNode<A> {
             mode: input.mode,
             data,
         };
-        Box::pin(self.action.run(event, ctx))
+        self.action.run(event, ctx)
     }
 }
 

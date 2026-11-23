@@ -129,7 +129,7 @@ impl Action for Flip {
     type Value = Signal;
     type Input = RsiCandle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Signal, RsiCandle>,
         ctx: &mut ActionContext,
@@ -154,8 +154,7 @@ impl Action for Flip {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     // Falling, rising, then falling again.
     let src = g.source(common::replay(
@@ -181,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &band,
     );
 
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
     log("main", "done");
     Ok(())
 }

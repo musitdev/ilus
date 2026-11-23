@@ -70,7 +70,7 @@ impl Action for PrintAt {
     type Value = Low;
     type Input = RsiCandle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Low, RsiCandle>,
         ctx: &mut ActionContext,
@@ -86,8 +86,7 @@ impl Action for PrintAt {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let candles = common::candles(&[20, 19, 18, 17, 16, 15, 16, 14, 13]);
     let mut g = Graph::new();
     let src = g.source(MockSource::live("SOLUSDT", Timeframe::M1, candles));
@@ -97,9 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Simulated clock: starts at 00:00, waiting only advances it.
     let start = DateTime::<Utc>::UNIX_EPOCH;
-    Executor::new(g)
-        .with_clock(Clock::Simulated(start))
-        .run()
-        .await;
+    Executor::new(g).with_clock(Clock::Simulated(start)).run()?;
     Ok(())
 }

@@ -3,6 +3,7 @@
 use std::any::Any;
 
 use chrono::{DateTime, Utc};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::error::ActionError;
@@ -14,8 +15,11 @@ use crate::trigger::{TriggerEvent, TriggerValue};
 ///
 /// An action is connected to **exactly one** condition; if two conditions need
 /// the same behaviour, each gets its own instance. An action can keep state.
-/// It is awaited within the tick: for network work, start a task (copying what
-/// it needs) and return at once.
+///
+/// It is **sync** and runs on the executor thread: a slow action only makes
+/// the tick longer. Network work (order, webhook) must be started with
+/// [`ActionContext::spawn`], which runs it on the async runtime and returns at
+/// once; its result can come back with [`ActionContext::deferred`].
 pub trait Action: Send + 'static {
     /// Value type of the condition it is connected to.
     type Value: TriggerValue;
@@ -28,21 +32,27 @@ pub trait Action: Send + 'static {
         &mut self,
         event: TriggerEvent<'_, Self::Value, Self::Input>,
         ctx: &mut ActionContext,
-    ) -> impl Future<Output = Result<(), ActionError>> + Send;
+    ) -> Result<(), ActionError>;
 }
 
-/// Lets an action send modifiers to conditions and transformers.
+/// Lets an action send modifiers, start async work and read the executor time.
 pub struct ActionContext {
     pub(crate) modifiers: Vec<Envelope>,
-    pub(crate) deferred: mpsc::UnboundedSender<Envelope>,
+    deferred: mpsc::UnboundedSender<Envelope>,
+    runtime: Handle,
     now: DateTime<Utc>,
 }
 
 impl ActionContext {
-    pub(crate) fn new(deferred: mpsc::UnboundedSender<Envelope>, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(
+        deferred: mpsc::UnboundedSender<Envelope>,
+        runtime: Handle,
+        now: DateTime<Utc>,
+    ) -> Self {
         Self {
             modifiers: Vec::new(),
             deferred,
+            runtime,
             now,
         }
     }
@@ -58,9 +68,14 @@ impl ActionContext {
             .push((to.node, Box::new(modifier) as Box<dyn Any + Send>));
     }
 
-    /// A sender usable from a background task (e.g. network work started by
-    /// the action). Its modifiers are applied at the end of the first tick
-    /// after they arrive.
+    /// Run async work (e.g. a network request) on the async runtime, without
+    /// waiting for it. Copy into it what it needs.
+    pub fn spawn(&self, work: impl Future<Output = ()> + Send + 'static) {
+        self.runtime.spawn(work);
+    }
+
+    /// A sender usable from async work started with [`spawn`](Self::spawn).
+    /// Its modifiers are applied at the end of the first tick after they arrive.
     pub fn deferred<M: ModifierValue>(&self, to: &ModifierHandle<M>) -> DeferredModifier<M> {
         DeferredModifier::new(to, self.deferred.clone())
     }
@@ -91,7 +106,7 @@ impl<V: TriggerValue, D: SourceData> Action for Alert<V, D> {
     type Value = V;
     type Input = D;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, V, D>,
         _ctx: &mut ActionContext,

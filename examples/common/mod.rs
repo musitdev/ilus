@@ -72,7 +72,7 @@ impl<V: TriggerValue, D: SourceData> Action for LogAction<V, D> {
     type Value = V;
     type Input = D;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, V, D>,
         _ctx: &mut ActionContext,

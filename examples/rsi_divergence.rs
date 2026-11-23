@@ -41,7 +41,7 @@ impl Action for PrintDivergence {
     type Value = Divergence;
     type Input = RsiCandle;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Divergence, RsiCandle>,
         _ctx: &mut ActionContext,
@@ -66,8 +66,7 @@ impl Action for PrintDivergence {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     // Bootstrap: 500 candles to warm up RSI and pivots (no output), then live.
     let sol = g.source(BinanceSource::new("SOLUSDT", Timeframe::M1).with_bootstrap(500));
@@ -79,6 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     g.action(PrintDivergence, &divergence);
 
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
     Ok(())
 }

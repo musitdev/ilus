@@ -145,8 +145,7 @@ impl Condition for Rising {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     let src = g.source(common::replay(
         "BTCUSDT",
@@ -167,6 +166,7 @@ async fn main() {
         "main",
         "bootstrap = 3 (sma) + 1 (slope) + 0 (condition) = 4 candles",
     );
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
     log("main", "executor stopped: the source has ended");
+    Ok(())
 }

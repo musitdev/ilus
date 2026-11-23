@@ -81,7 +81,7 @@ impl Action for Print {
     type Value = Low;
     type Input = Rsis;
 
-    async fn run(
+    fn run(
         &mut self,
         event: TriggerEvent<'_, Low, Rsis>,
         _ctx: &mut ActionContext,
@@ -101,8 +101,7 @@ impl Action for Print {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let days: u64 = match std::env::args().nth(1) {
         Some(d) => d.parse().map_err(|e| format!("invalid days '{d}': {e}"))?,
         None => 3,
@@ -139,6 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     g.action(Print, &both_low);
 
-    Executor::new(g).with_tick(Duration::ZERO).run().await;
+    Executor::new(g).with_tick(Duration::ZERO).run()?;
     Ok(())
 }

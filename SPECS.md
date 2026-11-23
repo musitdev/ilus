@@ -73,7 +73,7 @@ let chart   = g.transform(chart, &sol_rsi);                                // fa
 let markers = g.modifier_handle(&chart);                                   // ModifierHandle<ChartModifier>
 g.action(Futures::new(.., markers), &div);
 g.action(Alert::new(), &div);                                              // several actions on one condition
-Executor::new(g).run().await;
+Executor::new(g).run()?;                                                   // blocking, on this thread
 ```
 
 - **Typed builder**: every builder call returns a typed handle (`Output<T>`); connecting an entity to an output of the wrong type is a **compile error**. Internally the executor stores nodes as trait objects (`dyn`), the only way to hold hundreds of entities of different types.
@@ -88,10 +88,12 @@ Executor::new(g).run().await;
 - The graph is acyclic by construction (an entity can only be connected to existing outputs). Modifiers are not edges: they go back from actions to a condition or a transformer through a typed handle.
 - There is no `Rule` and no channel between entities anymore.
 
-### 5.2 Execution: sync entities, async actions
-- **Transformers and conditions are sync** (no network): plain functions called by the executor.
-- **Sources**: the executor calls each source synchronously at its ticks; the call never blocks. Network work (REST requests) runs in the background inside the source; a tick returns the next item if one is ready.
-- **Actions can be async**: the executor **awaits** each action within the tick (§5.5). An action that needs the network (order, webhook) starts its own task for that work and returns at once, so the tick is not blocked. Results of such background work (e.g. "order filled") come back to the executor and are applied at the next tick boundary.
+### 5.2 Execution: a sync executor thread, an async runtime
+Blocking work and async work are never mixed: at least two threads.
+- The **executor thread** (the thread calling `Executor::run`, a blocking call) runs the ticks: sources' calls, transformers, conditions and actions, **all sync**, with a blocking sleep between ticks. A slow transformer, condition or action only makes the tick longer; it never blocks async work.
+- An **async runtime** (tokio, multi-threaded, 1 worker by default, `with_async_threads`), created and owned by the executor, runs on its own threads the **network work**: sources' fetches (history, live requests), and the work started by actions with `ActionContext::spawn` (e.g. sending an order). Results come back as modifiers (`ActionContext::deferred`), applied at the end of the first tick after they arrive.
+- A source call never blocks: it starts its network work on the runtime and returns the next item if one is ready.
+- `Executor::run` must be called from a thread, not from an async task (it returns an error). At the end, pending async work gets a few seconds to finish.
 
 ### 5.3 Running modes
 The running mode is set by the **source** and carried **in each data item**; transformers keep the mode of their input; the executor reads it from the data.
@@ -114,7 +116,7 @@ A source always starts with **bootstrap**, then goes to **normal** (live) or **r
 A tick is **fully sequential**:
 1. **Sources**: call every due source; each returns zero or one item.
 2. **Transformers and conditions**: for each new item, evaluate the downstream nodes in graph order. Each node runs at most once per item.
-3. **Actions**: for every detection (except from bootstrap items), run the connected actions, in graph order; the executor **waits for each action**.
+3. **Actions**: for every detection (except from bootstrap items), run the connected actions, in graph order (sync, on the executor thread).
 4. **Modifiers**: apply every modifier produced during the tick (and results of background action work received meanwhile), in the order they were sent.
 5. Next tick.
 
@@ -201,7 +203,7 @@ trait Condition: Send + 'static {
 }
 struct Detection<V> { event_type: TriggerEventType, value: V }
 
-/// Event given to an action (never for bootstrap items). The action is awaited
+/// Event given to an action (never for bootstrap items). The action runs
 /// within the tick, so the event borrows the detection and the item (no copy).
 struct TriggerEvent<'a, V, D> {
     condition: &'a str,           // name of the condition node
@@ -213,18 +215,19 @@ struct TriggerEvent<'a, V, D> {
     data: &'a D,                  // the triggering item (condition input)
 }
 
-/// Connected to exactly one condition: its value and input types. Awaited
-/// within the tick; network work is started in its own task (copying what it
-/// needs).
+/// Connected to exactly one condition: its value and input types. Sync, on
+/// the executor thread; network work is started with `ctx.spawn` on the async
+/// runtime (copying what it needs).
 trait Action: Send + 'static {
     type Value: TriggerValue;
     type Input: SourceData;
-    async fn run(&mut self, event: TriggerEvent<'_, Self::Value, Self::Input>,
+    fn run(&mut self, event: TriggerEvent<'_, Self::Value, Self::Input>,
         ctx: &mut ActionContext) -> Result<(), ActionError>;
 }
 
-/// Lets an action send modifiers (applied at the end of the tick), get a
-/// deferred sender for background tasks, and read the executor time.
+/// Lets an action send modifiers (applied at the end of the tick), start
+/// async work on the runtime (`spawn`), get a deferred sender for that work,
+/// and read the executor time.
 struct ActionContext { /* modifiers produced during the tick */ }
 
 /// Typed handle to send modifiers to a condition or a transformer
@@ -407,7 +410,7 @@ struct Executor { /* graph, tick, clock */ }
 
 **Behavior:**
 - An action receives a trigger event and executes.
-- An action is connected to **exactly one condition** and has one input value type. Two conditions needing the same behaviour use two instances. An action can keep **state** between events (e.g. a simulated wallet). It can be **async**; the executor awaits it within the tick (§5.5). Network work is started in its own task so the tick is not blocked.
+- An action is connected to **exactly one condition** and has one input value type. Two conditions needing the same behaviour use two instances. An action can keep **state** between events (e.g. a simulated wallet). It is **sync** and runs on the executor thread (§5.2). Network work is started on the async runtime with `ActionContext::spawn`, so the tick is not blocked; its result can come back with a deferred modifier.
 - Events are processed one at a time, in detection order, within the tick.
 - While running, an action may send **modifiers** to a condition or a transformer (F5), through handles given when the graph is built.
 - Actions of a tick run after all conditions of that tick, in graph order.
@@ -574,7 +577,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 ## 11. Decisions
 - Default source provider: Binance public API. Alternatives if geo-restricted later: Bybit, OKX, Kraken, Coinbase.
 - Provider sources deliver candles only (price and volume). Derived data comes from transformers.
-- **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs fully sequential ticks (sources → transformers and conditions → actions → modifiers). Transformers and conditions are sync; actions can be async and are awaited (network work in their own task). No `Rule`, no channels between entities, no event queue.
+- **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs fully sequential ticks (sources → transformers and conditions → actions → modifiers). Transformers, conditions and actions are sync and run on the executor thread; network work (sources' fetches, actions' sends) runs on an async runtime on its own threads. No `Rule`, no channels between entities, no event queue.
 - Running modes carried in the data, set by the source: bootstrap (warm-up, no action events), replay (history with action events), normal (live).
 - Ticks: bootstrap and replay share a global 10 ms tick (one item per source, sources called in graph order); normal mode is aligned on candle close (+2 s), then every half period.
 - One input per transformer and per condition. A merge source (built from two sources before the graph, paired by time without look-ahead) combines sources; a combined transformer runs several transformers as one node; split is fan-out; an aggregation transformer builds longer timeframes. No merge or split of transformer outputs.

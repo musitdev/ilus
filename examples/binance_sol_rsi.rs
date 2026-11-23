@@ -76,8 +76,7 @@ impl Condition for RsiExtreme {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     // Bootstrap: at least 50 candles (more than the RSI warm-up), then live.
     let sol = g.source(BinanceSource::new("SOLUSDT", Timeframe::M1).with_bootstrap(50));
@@ -92,6 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     g.action(Alert::new(), &extreme);
 
-    Executor::new(g).run().await;
+    Executor::new(g).run()?;
     Ok(())
 }

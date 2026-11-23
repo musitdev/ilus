@@ -16,10 +16,12 @@
 //!   forwarding the input), e.g. RSI.
 //! - [`condition`]: sync, detect situations on one input.
 //! - [`trigger`]: detections and trigger events.
-//! - [`action`]: react to the detections of one condition (can be async).
+//! - [`action`]: react to the detections of one condition (sync; network work
+//!   is started on the async runtime).
 //! - [`modifier`]: information sent back to a condition or a transformer.
 //! - [`graph`]: typed builder of the graph.
-//! - [`executor`]: runs the graph.
+//! - [`executor`]: runs the graph on the calling thread, with an async
+//!   runtime on its own threads for network work.
 //!
 //! Everything is wired in code: no configuration file.
 

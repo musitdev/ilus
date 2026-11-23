@@ -1,11 +1,20 @@
 //! The executor: runs a [`Graph`] tick by tick (spec §5.4, §5.5).
 //!
+//! Two kinds of threads, never mixed:
+//! - the **executor thread** (the one calling [`Executor::run`]) runs the
+//!   ticks: sources' calls, transformers, conditions and actions, all sync,
+//!   with a blocking sleep between ticks. A slow node only delays the tick;
+//! - an **async runtime** owned by the executor, on its own threads, runs the
+//!   async work: sources' network fetches and the network work started by
+//!   actions ([`ActionContext::spawn`](crate::action::ActionContext::spawn)).
+//!
 //! A tick is fully sequential:
 //! 1. call the due sources (each returns zero or one item);
 //! 2. evaluate the downstream transformers and conditions, in graph order;
 //! 3. run the actions of the conditions that triggered (except for bootstrap
-//!    items), in graph order, awaiting each one;
-//! 4. apply the modifiers produced during the tick, in send order;
+//!    items), in graph order;
+//! 4. apply the modifiers produced during the tick, then those sent by async
+//!    work since the previous tick, in arrival order;
 //! 5. wait for the next tick.
 //!
 //! While a source is in bootstrap or replay mode, ticks are global and run
@@ -16,6 +25,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::action::ActionContext;
@@ -25,6 +35,12 @@ use crate::source::Mode;
 
 /// Default global tick in bootstrap and replay modes.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(10);
+
+/// Default number of threads of the async runtime.
+pub const DEFAULT_ASYNC_THREADS: usize = 1;
+
+/// How long the async work may still run after the last tick.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Time used by the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,20 +61,18 @@ impl Clock {
         }
     }
 
-    async fn sleep(&mut self, d: Duration) {
+    /// Blocking sleep of the executor thread (never a runtime thread).
+    fn sleep(&mut self, d: Duration) {
         match self {
-            Self::System if d.is_zero() => tokio::task::yield_now().await,
-            Self::System => tokio::time::sleep(d).await,
-            Self::Simulated(t) => {
-                *t += TimeDelta::from_std(d).unwrap_or_default();
-                tokio::task::yield_now().await;
-            }
+            Self::System if d.is_zero() => std::thread::yield_now(),
+            Self::System => std::thread::sleep(d),
+            Self::Simulated(t) => *t += TimeDelta::from_std(d).unwrap_or_default(),
         }
     }
 
-    async fn sleep_until(&mut self, at: DateTime<Utc>) {
+    fn sleep_until(&mut self, at: DateTime<Utc>) {
         let d = (at - self.now()).to_std().unwrap_or_default();
-        self.sleep(d).await;
+        self.sleep(d);
     }
 }
 
@@ -67,6 +81,7 @@ pub struct Executor {
     graph: Graph,
     tick: Duration,
     clock: Clock,
+    async_threads: usize,
 }
 
 impl Executor {
@@ -97,7 +112,14 @@ impl Executor {
             graph,
             tick: DEFAULT_TICK,
             clock: Clock::System,
+            async_threads: DEFAULT_ASYNC_THREADS,
         }
+    }
+
+    /// Number of threads of the async runtime (at least 1).
+    pub fn with_async_threads(mut self, threads: usize) -> Self {
+        self.async_threads = threads.max(1);
+        self
     }
 
     /// Global tick in bootstrap and replay modes (zero: as fast as possible).
@@ -112,13 +134,30 @@ impl Executor {
         self
     }
 
-    /// Run until every source has ended.
-    pub async fn run(self) {
+    /// Run on the calling thread until every source has ended. Blocking.
+    ///
+    /// Must not be called from an async task: run it on its own thread (or
+    /// from `main`).
+    pub fn run(self) -> Result<(), std::io::Error> {
         let Self {
             graph,
             tick,
             mut clock,
+            async_threads,
         } = self;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(std::io::Error::other(
+                "Executor::run is blocking: call it from a thread, not from an async task",
+            ));
+        }
+        let runtime: Runtime = Builder::new_multi_thread()
+            .worker_threads(async_threads)
+            .thread_name("ilus-async")
+            .enable_all()
+            .build()?;
+        // Lets sources and actions start async work from this thread.
+        let guard = runtime.enter();
+        let handle = runtime.handle().clone();
         let Graph {
             mut nodes,
             mut actions,
@@ -172,7 +211,7 @@ impl Executor {
             }
 
             // 3. Actions of the conditions that triggered (not for bootstrap items).
-            let mut ctx = ActionContext::new(deferred_tx.clone(), now);
+            let mut ctx = ActionContext::new(deferred_tx.clone(), handle.clone(), now);
             for action in actions.iter_mut() {
                 let c = action.condition();
                 let Some(Some(detection)) = slots.get(c) else {
@@ -196,7 +235,7 @@ impl Executor {
                     time: detection.time,
                     mode: detection.mode,
                 };
-                if let Err(e) = action.run(input, &mut ctx).await {
+                if let Err(e) = action.run(input, &mut ctx) {
                     eprintln!("[{}] {e}", node.name);
                 }
             }
@@ -225,15 +264,20 @@ impl Executor {
 
             // 5. Wait for the next tick.
             if fast {
-                clock.sleep(tick).await;
+                clock.sleep(tick);
             } else {
                 let next = (0..n)
                     .filter(|&i| !ended[i])
                     .filter_map(|i| next_due[i])
                     .min()
                     .unwrap_or(now);
-                clock.sleep_until(next).await;
+                clock.sleep_until(next);
             }
         }
+
+        // Let pending async work (e.g. an order being sent) finish.
+        drop(guard);
+        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+        Ok(())
     }
 }
