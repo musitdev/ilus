@@ -368,7 +368,11 @@ struct Executor { /* graph, tick, clock */ }
   - Normal: at each tick, one request for the latest closed candles; candles missed since the last one are included, so a reconnection is just the next request.
   - Fallback endpoint (market data only): `https://data-api.binance.vision` (selectable with `with_endpoints`).
   - The symbol is checked at startup; an unknown symbol stops the source with `SourceError::Unknown`.
-  - REST errors are retried up to 5 times (backoff 1 s → 60 s; `Retry-After` honored on HTTP 429/418), then the source stops.
+  - Failures at two levels:
+    - each REST request is retried up to 5 times inside its task (backoff 1 s → 60 s; `Retry-After` honoured on HTTP 429/418);
+    - every background task (history, live request) is **supervised**: the source keeps its handle and checks it at each call, without blocking. If the task fails (error or panic), the source **reconnects** up to `MAX_RECONNECTS` = 5 times, waiting **half its period** between attempts (30 s for 1m, 7.5 min for 15m), then ends with a log. History resumes after the last candle delivered (nothing delivered twice); live requests include the missed candles. A success resets the count.
+    - An unknown symbol is a configuration error: the source ends at once, without reconnecting.
+    - Running tasks are cancelled when the source is dropped.
   - Prices and volumes are received as strings and must be parsed to `Decimal` (never floats).
 
 **Test sources:**
@@ -383,7 +387,7 @@ struct Executor { /* graph, tick, clock */ }
 - [ ] A source can be replaced by a test/mock source delivering candles from memory, without changing condition code.
 
 **Edge cases & errors:**
-- Request failed in normal mode: retried at the next tick; the missed candles come with the next successful request, so none is skipped or duplicated.
+- Request failed in normal mode: reconnection after half a period (up to 5 times); the missed candles come with the next successful request, so none is skipped or duplicated.
 - Duplicate or out-of-order candles from the provider: ignored.
 - Missing candle: the source refetches it, up to N retries (with backoff); if it still fails, the error is logged and the source stops.
 - Provider rate limits: respected; never exceeded.
