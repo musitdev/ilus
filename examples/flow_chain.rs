@@ -1,38 +1,38 @@
-//! Data propagation through a transformer chain.
+//! Data propagation through a transformer chain, inside one tick.
 //!
 //! ```text
 //! MockSource ──Candle──> Sma(3) ──Derived<Candle, sma>──> Slope ──Derived<Derived<Candle, sma>, slope>──> Rising ──> LogAction
 //! ```
 //!
 //! What to check in the output:
-//! - every candle reaches the condition, even during warm-up (values are `None`);
-//! - `None` propagates: Slope has no value while Sma has none;
-//! - the condition can read every level: candle, sma, slope;
-//! - when the source ends, the whole chain ends and `bot.run()` returns.
+//! - each tick runs the whole chain for one candle: sma, slope, condition, action;
+//! - the first candles are *bootstrap* (warm-up of SMA + slope + condition):
+//!   they go through the chain but produce no action event;
+//! - the condition can read every level: candle, sma, slope.
 //!
 //! Run with: `cargo run --example flow_chain`
 
 mod common;
 
-use common::{LogAction, idx, log, mock};
-use ilus::bot::Bot;
+use common::{LogAction, idx, log};
 use ilus::candle::Candle;
 use ilus::condition::Condition;
 use ilus::error::ModifierError;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
 use ilus::modifier::NoModifier;
-use ilus::rule::Rule;
-use ilus::source::Source;
-use ilus::transformer::{Derived, Transformed, Transformer};
+use ilus::source::Item;
+use ilus::transformer::{Derived, Transformer};
 use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
 use rust_decimal::Decimal;
 
 type SmaCandle = Derived<Candle, Decimal>;
+type SlopeCandle = Derived<SmaCandle, Decimal>;
 
 /// Round for display only.
 fn r(v: Option<Decimal>) -> Option<Decimal> {
     v.map(|v| v.round_dp(3))
 }
-type SlopeCandle = Derived<SmaCandle, Decimal>;
 
 /// Simple moving average of closes.
 struct Sma {
@@ -48,16 +48,11 @@ impl Transformer for Sma {
     fn name(&self) -> String {
         format!("sma({})", self.period)
     }
-
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
-        match m {}
-    }
-
     fn warm_up(&self) -> usize {
         self.period
     }
-
-    fn on_data(&mut self, c: &Candle) -> Option<Decimal> {
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Decimal> {
+        let c = item.data;
         self.window.push(c.close);
         if self.window.len() > self.period {
             self.window.remove(0);
@@ -66,9 +61,18 @@ impl Transformer for Sma {
             .then(|| self.window.iter().sum::<Decimal>() / Decimal::from(self.period));
         log(
             "sma",
-            format!("candle #{} close={} -> sma={:?}", idx(c), c.close, r(sma)),
+            format!(
+                "candle #{} close={} -> sma={:?} ({:?})",
+                idx(c),
+                c.close,
+                r(sma),
+                item.mode
+            ),
         );
         sma
+    }
+    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+        match m {}
     }
 }
 
@@ -85,30 +89,18 @@ impl Transformer for Slope {
     fn name(&self) -> String {
         "slope".into()
     }
-
+    fn warm_up(&self) -> usize {
+        1
+    }
+    fn on_data(&mut self, item: Item<'_, SmaCandle>) -> Option<Decimal> {
+        // No SMA yet -> no slope (warm-up propagates down the chain).
+        let sma = item.data.value;
+        let slope = sma.and_then(|s| self.prev.replace(s).map(|p| s - p));
+        log("slope", format!("sma={:?} -> slope={:?}", r(sma), r(slope)));
+        slope
+    }
     fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
         match m {}
-    }
-
-    fn warm_up(&self) -> usize {
-        2
-    }
-
-    fn on_data(&mut self, item: &SmaCandle) -> Option<Decimal> {
-        // No SMA yet -> no slope (warm-up propagates down the chain).
-        let slope = item
-            .value
-            .and_then(|sma| self.prev.replace(sma).map(|p| sma - p));
-        log(
-            "slope",
-            format!(
-                "candle #{} sma={:?} -> slope={:?}",
-                idx(&item.data),
-                r(item.value),
-                r(slope)
-            ),
-        );
-        slope
     }
 }
 
@@ -125,11 +117,13 @@ impl Condition for Rising {
     type Value = RisingBy;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, item: &SlopeCandle) -> Option<Detection<RisingBy>> {
+    fn warm_up(&self) -> usize {
+        0
+    }
+    fn on_data(&mut self, item: Item<'_, SlopeCandle>) -> Option<Detection<RisingBy>> {
         // Every level of the chain is available here.
-        let candle = &item.data.data;
-        let sma = item.data.value;
-        let slope = item.value;
+        let candle = &item.data.data.data;
+        let (sma, slope) = (item.data.data.value, item.data.value);
         log(
             "condition",
             format!(
@@ -143,37 +137,36 @@ impl Condition for Rising {
         let slope = slope.filter(|s| *s > Decimal::ZERO)?;
         Some(Detection {
             event_type: TriggerEventType::Other("rising"),
-            value: RisingBy(slope),
+            value: RisingBy(slope.round_dp(3)),
         })
     }
-
     fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
         match m {}
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut bot = Bot::new();
-
-    let mut src = mock("BTCUSDT", &[10, 11, 12, 11, 10, 11, 13, 14], 100);
-    let mut sma = Transformed::new(
+async fn main() {
+    let mut g = Graph::new();
+    let src = g.source(common::replay(
+        "BTCUSDT",
+        &[10, 11, 12, 11, 10, 11, 13, 14, 15],
+    ));
+    let sma = g.transform(
         Sma {
             period: 3,
             window: vec![],
         },
-        src.get_source_stream()?,
+        &src,
     );
-    let mut slope = Transformed::new(Slope { prev: None }, sma.get_source_stream()?);
-    let stream = slope.get_source_stream()?;
-    log("main", format!("rule source = {}", stream.info()));
+    let slope = g.transform(Slope { prev: None }, &sma);
+    let rising = g.condition("rising", Rising, &slope);
+    g.action(LogAction::new("action"), &rising);
 
-    bot.rule(Rule::new("rising", stream, Rising, LogAction));
-    bot.source(src);
-    bot.source(sma);
-    bot.source(slope);
-
-    bot.run().await;
-    log("main", "bot.run() returned: source ended, chain ended");
-    Ok(())
+    log(
+        "main",
+        "bootstrap = 3 (sma) + 1 (slope) + 0 (condition) = 4 candles",
+    );
+    Executor::new(g).run().await;
+    log("main", "executor stopped: the source has ended");
 }

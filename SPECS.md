@@ -68,11 +68,11 @@ flowchart LR
 let mut g = Graph::new();
 let sol     = g.source(BinanceSource::new("SOLUSDT", M15));                // Output<Candle>
 let sol_rsi = g.transform(Rsi::new(14)?, &sol);                            // Output<RsiCandle>
-let div     = g.condition(RsiDivergence::default(), &sol_rsi);             // Output<Detection<Divergence>>
+let div     = g.condition("div", RsiDivergence::default(), &sol_rsi);      // ConditionOutput<Divergence, RsiCandle>
 let chart   = g.transform(chart, &sol_rsi);                                // fan-out: same output used twice
 let markers = g.modifier_handle(&chart);                                   // ModifierHandle<ChartModifier>
 g.action(Futures::new(.., markers), &div);
-g.action(Alert, &div);                                                     // several actions on one condition
+g.action(Alert::new(), &div);                                              // several actions on one condition
 Executor::new(g).run().await;
 ```
 
@@ -160,8 +160,12 @@ struct Candle {
 trait Source: Send + 'static {
     type Data: SourceData;
     fn info(&self) -> SourceInfo;
+    /// Bootstrap length computed from the graph (called once, before the first call).
+    fn set_bootstrap(&mut self, items: usize);
+    /// Current mode: bootstrap and replay sources are called at every global tick.
+    fn mode(&self) -> Mode;
     /// Next closed item, if one is ready, with its mode; `Ended` after a replay.
-    fn poll(&mut self, now: DateTime<Utc>) -> Poll<(Self::Data, Mode)>;
+    fn poll(&mut self, now: DateTime<Utc>) -> SourcePoll<Self::Data>;
     /// When the executor must call it next (bootstrap/replay: global tick;
     /// normal: next candle close + delay, or half period).
     fn next_call(&self, now: DateTime<Utc>) -> Schedule;
@@ -194,24 +198,28 @@ struct Detection<V> { event_type: TriggerEventType, value: V }
 
 /// Event given to an action (never for bootstrap items). The action is awaited
 /// within the tick, so the event borrows the detection and the item (no copy).
-struct TriggerEvent<'a, V> {
+struct TriggerEvent<'a, V, D> {
     condition: &'a str,           // name of the condition node
     event_type: TriggerEventType,
     value: &'a V,
     source: &'a SourceInfo,
     time: DateTime<Utc>,          // time of the triggering item
     mode: Mode,                   // replay or normal
+    data: &'a D,                  // the triggering item (condition input)
 }
 
-/// One input value type, defined by the action. Awaited within the tick;
-/// network work is started in its own task (copying what it needs).
+/// Connected to exactly one condition: its value and input types. Awaited
+/// within the tick; network work is started in its own task (copying what it
+/// needs).
 trait Action: Send + 'static {
     type Value: TriggerValue;
-    async fn run(&mut self, event: TriggerEvent<'_, Self::Value>, ctx: &mut ActionContext)
-        -> Result<(), ActionError>;
+    type Input: SourceData;
+    async fn run(&mut self, event: TriggerEvent<'_, Self::Value, Self::Input>,
+        ctx: &mut ActionContext) -> Result<(), ActionError>;
 }
 
-/// Lets an action send modifiers; they are applied at the end of the tick.
+/// Lets an action send modifiers (applied at the end of the tick), get a
+/// deferred sender for background tasks, and read the executor time.
 struct ActionContext { /* modifiers produced during the tick */ }
 
 /// Typed handle to send modifiers to a condition or a transformer
@@ -226,15 +234,16 @@ impl Graph {
     fn source<S: Source>(&mut self, s: S) -> Output<S::Data>;
     fn transform<T: Transformer, M>(&mut self, t: T, input: &Output<T::Input, M>)
         -> Output<Derived<T::Input, T::Value>, T::Modifier>;
-    fn condition<C: Condition, M>(&mut self, c: C, input: &Output<C::Input, M>)
-        -> Output<Detection<C::Value>, C::Modifier>;
-    fn action<A: Action, M>(&mut self, a: A, input: &Output<Detection<A::Value>, M>);
-    /// Typed handle to send modifiers to the node producing `output`.
-    fn modifier_handle<T, M: ModifierValue>(&self, output: &Output<T, M>) -> ModifierHandle<M>;
+    fn condition<C: Condition, M>(&mut self, name: &str, c: C, input: &Output<C::Input, M>)
+        -> ConditionOutput<C::Value, C::Input, C::Modifier>;
+    fn action<A: Action, M>(&mut self, a: A, c: &ConditionOutput<A::Value, A::Input, M>);
+    /// Typed handle to send modifiers to the node of `output` (transformer or condition).
+    fn modifier_handle<H: NodeHandle>(&self, output: &H) -> ModifierHandle<H::Modifier>;
 }
 
-/// Runs the graph tick by tick (§5.5) until every source has ended.
-struct Executor { /* graph, source schedules, modifiers of the current tick */ }
+/// Runs the graph tick by tick (§5.5) until every source has ended. The clock
+/// is the system clock, or a simulated clock (tests: waiting only advances it).
+struct Executor { /* graph, tick, clock */ }
 ```
 
 ## 7. Features
@@ -324,7 +333,7 @@ struct Executor { /* graph, source schedules, modifiers of the current tick */ }
 - A source is added once to the graph; its output can feed any number of consumers (fan-out, §5.1), with a single connection to the provider.
 - Provider sources deliver **candles only** (price and volume). Other provider data (order book, trades, external indicators) is out of scope for now. Derived data (e.g. RSI) is produced by transformers.
 - The timeframe is requested directly from the provider (ilus does not aggregate candles). It is fixed at startup and does not change while running.
-- Modes (§5.3): **bootstrap** warms up with the last closed candles before the start (length computed from the graph, §5.4; no action events); then either live data (**normal**), or `replay(from, to)`: every candle of the period, with action events, after which the source ends.
+- Modes (§5.3): **bootstrap** warms up with the last closed candles before the start (length computed from the graph, §5.4, or more with `with_bootstrap(n)`; no action events); then either live data (**normal**), or `replay(from, to)`: every candle of the period, with action events, after which the source ends.
 - A source signals whether a candle is closed; only closed candles are passed to conditions (see F0).
 - **Merge / split sources** (to be defined): build a new source from existing ones, e.g. merge two timeframes of the same asset for a condition that needs both.
 

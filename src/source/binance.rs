@@ -1,303 +1,377 @@
-//! Binance public market-data source (spec F1, default source).
+//! Binance public market-data source, REST only (spec F1).
 //!
-//! - History: REST `GET /api/v3/klines` (max 1000 candles per call).
-//! - Live: WebSocket `<symbol>@kline_<interval>`; a candle is closed when `k.x` is true.
-//! - No account or API key needed.
+//! - **Bootstrap**: the last closed candles before the start (the replay start,
+//!   or now), as many as the graph needs.
+//! - **Replay** (`replay(from, to)`): every closed candle of the period, then
+//!   the source ends.
+//! - **Normal** (live): one request per call, at the aligned schedule of
+//!   [`next_aligned_call`]; candles missed since the last one are included.
 //!
-//! Behavior: only closed candles are sent, in order, without duplicates.
-//! After a disconnection the source reconnects with backoff and fetches the
-//! missing candles over REST before resuming. REST errors are retried up to
-//! [`MAX_RETRIES`] times; after that the source stops with an error.
+//! History is fetched in the background by pages of 1000 candles; each call
+//! takes one candle from the buffer. A call never blocks. REST errors are
+//! retried up to [`MAX_RETRIES`] times.
 
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use serde_json::Value;
-use tokio_stream::StreamExt;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::candle::Candle;
 use crate::error::SourceError;
-use crate::source::{Source, SourceChannel, SourceInfo, SourceSender, Timeframe};
+use crate::source::{
+    CLOSE_DELAY, Mode, Source, SourceInfo, SourcePoll, Timeframe, next_aligned_call,
+};
 
 /// Default REST endpoint.
 pub const REST_URL: &str = "https://api.binance.com";
-/// Default WebSocket endpoint.
-pub const WS_URL: &str = "wss://stream.binance.com:9443";
 /// Fallback REST endpoint (market data only).
 pub const REST_URL_FALLBACK: &str = "https://data-api.binance.vision";
-/// Fallback WebSocket endpoint (market data only).
-pub const WS_URL_FALLBACK: &str = "wss://data-stream.binance.vision";
 
-/// Max retries of a failing REST request before the source stops.
+/// Max retries of a failing REST request.
 pub const MAX_RETRIES: u32 = 5;
 /// Max candles per REST request (Binance limit).
 const PAGE_LIMIT: usize = 1000;
-/// Reconnect if no WebSocket message is received for this long
-/// (Binance pushes kline updates every ~2 s).
-const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Where the source starts.
-#[derive(Debug, Clone, Copy)]
-enum Start {
-    /// Live data only.
-    Now,
-    /// The last `n` closed candles, then live data.
-    History(u32),
-    /// Every candle from this time, then live data.
-    At(DateTime<Utc>),
-}
+/// Delay before calling again while a live request is in flight.
+const IN_FLIGHT_RETRY: TimeDelta = TimeDelta::milliseconds(500);
 
 /// Binance spot candle source.
 pub struct BinanceSource {
-    channel: SourceChannel<Candle>,
+    info: SourceInfo,
     asset: String,
     timeframe: Timeframe,
-    start: Start,
-    end: Option<DateTime<Utc>>,
     rest_url: String,
-    ws_url: String,
+    bootstrap: usize,
+    replay: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Open time of the last candle delivered.
+    last_open: Option<DateTime<Utc>>,
+    /// HTTP client, created at the first call.
+    fetcher: Option<Fetcher>,
+    state: State,
+}
+
+enum HistMsg {
+    Candle(Candle, Mode),
+    Done,
+    Failed(SourceError),
+}
+
+enum State {
+    Start,
+    History(mpsc::UnboundedReceiver<HistMsg>),
+    Live {
+        queue: VecDeque<Candle>,
+        in_flight: Option<oneshot::Receiver<Result<Vec<Candle>, SourceError>>>,
+    },
+    Ended,
 }
 
 impl BinanceSource {
-    /// Source for `asset` (Binance symbol, e.g. `SOLUSDT`) and `timeframe`.
-    /// Starts with live data only; see [`with_history`](Self::with_history)
-    /// and [`with_start`](Self::with_start).
+    /// Live source for `asset` (Binance symbol, e.g. `SOLUSDT`): bootstrap,
+    /// then normal mode. See [`replay`](Self::replay) for a backtest.
     pub fn new(asset: impl Into<String>, timeframe: Timeframe) -> Self {
         let asset = asset.into().to_uppercase();
-        let info = SourceInfo::Provider {
-            provider: "binance".into(),
-            asset: asset.clone(),
-            timeframe,
-        };
         Self {
-            channel: SourceChannel::new(info),
+            info: SourceInfo::Provider {
+                provider: "binance".into(),
+                asset: asset.clone(),
+                timeframe,
+            },
             asset,
             timeframe,
-            start: Start::Now,
-            end: None,
             rest_url: REST_URL.into(),
-            ws_url: WS_URL.into(),
+            bootstrap: 0,
+            replay: None,
+            last_open: None,
+            fetcher: None,
+            state: State::Start,
         }
     }
 
-    /// First send the last `candles` closed candles (backfill), then live data.
-    pub fn with_history(mut self, candles: u32) -> Self {
-        self.start = Start::History(candles);
+    /// Replay every closed candle from `from` to `to` (after the bootstrap,
+    /// taken before `from`), then end.
+    pub fn replay(mut self, from: DateTime<Utc>, to: DateTime<Utc>) -> Self {
+        self.replay = Some((from, to));
         self
     }
 
-    /// First send every closed candle since `start`, then live data.
-    pub fn with_start(mut self, start: DateTime<Utc>) -> Self {
-        self.start = Start::At(start);
+    /// At least `n` bootstrap candles (the graph may ask for more).
+    pub fn with_bootstrap(mut self, n: usize) -> Self {
+        self.bootstrap = self.bootstrap.max(n);
         self
     }
 
-    /// Stop after the last candle closed before `end`: the source only replays
-    /// history and never switches to live data (e.g. for a simulation).
-    /// An `end` in the future is capped at the current time.
-    pub fn with_end(mut self, end: DateTime<Utc>) -> Self {
-        self.end = Some(end);
-        self
-    }
-
-    /// Use other endpoints (e.g. [`REST_URL_FALLBACK`], [`WS_URL_FALLBACK`]).
-    pub fn with_endpoints(
-        mut self,
-        rest_url: impl Into<String>,
-        ws_url: impl Into<String>,
-    ) -> Self {
+    /// Use another REST endpoint (e.g. [`REST_URL_FALLBACK`]).
+    pub fn with_endpoint(mut self, rest_url: impl Into<String>) -> Self {
         self.rest_url = rest_url.into();
-        self.ws_url = ws_url.into();
         self
+    }
+
+    fn make_fetcher(&self) -> Result<Fetcher, SourceError> {
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .map_err(|e| SourceError::Provider(e.to_string()))?;
+        Ok(Fetcher {
+            client,
+            rest_url: self.rest_url.clone(),
+            asset: self.asset.clone(),
+            timeframe: self.timeframe,
+            name: self.info.to_string(),
+        })
+    }
+
+    fn fail(&mut self, e: &SourceError) -> SourcePoll<Candle> {
+        eprintln!("[{}] {e}", self.info);
+        self.state = State::Ended;
+        SourcePoll::Ended
     }
 }
 
 impl Source for BinanceSource {
     type Data = Candle;
 
-    fn channel(&mut self) -> &mut SourceChannel<Candle> {
-        &mut self.channel
+    fn info(&self) -> SourceInfo {
+        self.info.clone()
     }
 
-    async fn run(self) -> Result<(), SourceError> {
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .map_err(|e| SourceError::Provider(e.to_string()))?;
-        let ws_url = format!(
-            "{}/ws/{}@kline_{}",
-            self.ws_url,
-            self.asset.to_lowercase(),
-            self.timeframe
-        );
-        let mut feed = Feed {
-            client,
-            rest_url: self.rest_url,
-            asset: self.asset,
-            timeframe: self.timeframe,
-            sender: self.channel.into_sender(),
-            last_open: None,
-            end: self.end,
-        };
+    fn set_bootstrap(&mut self, items: usize) {
+        self.bootstrap = self.bootstrap.max(items);
+    }
 
-        // Fail early on an unknown asset.
-        feed.fetch_klines(None, 1).await?;
-
-        let from = match self.start {
-            Start::Now => None,
-            // `now` falls inside the forming candle: go back one more period
-            // so that exactly `n` closed candles are returned.
-            Start::History(n) => Some(Utc::now() - feed.timeframe.duration() * (n as i32 + 1)),
-            Start::At(t) => Some(t),
-        };
-        if let Some(from) = from
-            && feed.backfill(from).await? == Flow::ConsumerGone
-        {
-            return Ok(());
+    fn mode(&self) -> Mode {
+        match &self.state {
+            State::Start | State::History(_) if self.replay.is_some() => Mode::Replay,
+            State::Start if self.bootstrap == 0 => Mode::Normal,
+            State::Start | State::History(_) => Mode::Bootstrap,
+            State::Live { .. } | State::Ended => Mode::Normal,
         }
-        if feed.end.is_some() {
-            feed.log("end reached, history replay done");
-            return Ok(());
-        }
+    }
 
-        let mut backoff = BACKOFF_START;
-        loop {
-            match tokio_tungstenite::connect_async(ws_url.as_str()).await {
-                Ok((ws, _)) => {
-                    backoff = BACKOFF_START;
-                    feed.log("connected");
-                    if feed.live(ws).await? == Flow::ConsumerGone {
-                        return Ok(());
+    fn poll(&mut self, _now: DateTime<Utc>) -> SourcePoll<Candle> {
+        match &mut self.state {
+            State::Start => {
+                let fetcher = match self.make_fetcher() {
+                    Ok(f) => f,
+                    Err(e) => return self.fail(&e),
+                };
+                self.fetcher = Some(fetcher.clone());
+                if self.bootstrap == 0 && self.replay.is_none() {
+                    self.state = State::Live {
+                        queue: VecDeque::new(),
+                        in_flight: None,
+                    };
+                } else {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    tokio::spawn(history(fetcher, self.bootstrap, self.replay, tx));
+                    self.state = State::History(rx);
+                }
+                SourcePoll::Pending
+            }
+            State::History(rx) => match rx.try_recv() {
+                Ok(HistMsg::Candle(candle, mode)) => {
+                    self.last_open = Some(candle.open_time);
+                    SourcePoll::Ready(candle, mode)
+                }
+                Ok(HistMsg::Done) if self.replay.is_some() => {
+                    self.state = State::Ended;
+                    SourcePoll::Ended
+                }
+                Ok(HistMsg::Done) => {
+                    self.state = State::Live {
+                        queue: VecDeque::new(),
+                        in_flight: None,
+                    };
+                    SourcePoll::Pending
+                }
+                Ok(HistMsg::Failed(e)) => self.fail(&e),
+                Err(mpsc::error::TryRecvError::Empty) => SourcePoll::Pending,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.fail(&SourceError::Provider("history task stopped".into()))
+                }
+            },
+            State::Live { queue, in_flight } => {
+                if let Some(rx) = in_flight {
+                    match rx.try_recv() {
+                        Ok(Ok(candles)) => {
+                            queue.extend(new_candles(candles, self.last_open));
+                            *in_flight = None;
+                        }
+                        Ok(Err(e)) => {
+                            // Retried at the next call; missed candles come with it.
+                            eprintln!("[{}] {e}", self.info);
+                            *in_flight = None;
+                        }
+                        Err(oneshot::error::TryRecvError::Empty) => {}
+                        Err(oneshot::error::TryRecvError::Closed) => *in_flight = None,
                     }
                 }
-                Err(e) => feed.log(&format!("connection failed: {e}")),
+                if let Some(candle) = queue.pop_front() {
+                    self.last_open = Some(candle.open_time);
+                    return SourcePoll::Ready(candle, Mode::Normal);
+                }
+                if in_flight.is_none()
+                    && let Some(fetcher) = self.fetcher.clone()
+                {
+                    let (tx, rx) = oneshot::channel();
+                    let last_open = self.last_open;
+                    tokio::spawn(async move {
+                        let _ = tx.send(latest(&fetcher, last_open).await);
+                    });
+                    *in_flight = Some(rx);
+                }
+                SourcePoll::Pending
             }
-            feed.log(&format!("reconnecting in {}s", backoff.as_secs()));
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
+            State::Ended => SourcePoll::Ended,
+        }
+    }
+
+    fn next_call(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        match &self.state {
+            State::Live { queue, .. } if !queue.is_empty() => now,
+            State::Live {
+                in_flight: Some(_), ..
+            } => now + IN_FLIGHT_RETRY,
+            _ => next_aligned_call(self.last_open, self.timeframe, now, CLOSE_DELAY),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Flow {
-    Continue,
-    Disconnected,
-    ConsumerGone,
+// ------------------------------------------------------- background work
+
+/// Bootstrap (candles before the start), then the replay period.
+async fn history(
+    f: Fetcher,
+    bootstrap: usize,
+    replay: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    tx: mpsc::UnboundedSender<HistMsg>,
+) {
+    let now = Utc::now();
+    let start = replay.map_or(now, |(from, _)| from);
+    let result = async {
+        if bootstrap > 0 {
+            let mut candles = Vec::new();
+            let from = bootstrap_from(start, f.timeframe, bootstrap);
+            f.range(from, start, now, |c| {
+                candles.push(c);
+                true
+            })
+            .await?;
+            let skip = candles.len().saturating_sub(bootstrap);
+            for c in candles.into_iter().skip(skip) {
+                if tx.send(HistMsg::Candle(c, Mode::Bootstrap)).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        if let Some((from, to)) = replay {
+            f.range(from, to.min(now), now, |c| {
+                tx.send(HistMsg::Candle(c, Mode::Replay)).is_ok()
+            })
+            .await?;
+        }
+        Ok::<(), SourceError>(())
+    }
+    .await;
+    let _ = tx.send(match result {
+        Ok(()) => HistMsg::Done,
+        Err(e) => HistMsg::Failed(e),
+    });
 }
 
-/// Running state of a Binance source.
-struct Feed {
+/// Live request: the closed candles since the last one, or the most recent
+/// closed candle if none was delivered yet.
+async fn latest(f: &Fetcher, last_open: Option<DateTime<Utc>>) -> Result<Vec<Candle>, SourceError> {
+    let now = Utc::now();
+    let mut candles = Vec::new();
+    match last_open {
+        Some(last) => {
+            f.range(last + f.timeframe.duration(), now, now, |c| {
+                candles.push(c);
+                true
+            })
+            .await?;
+        }
+        None => {
+            let rows = f.fetch_klines(None, 2).await?;
+            candles.extend(
+                rows.into_iter()
+                    .rev()
+                    .find(|k| k.close_time < now)
+                    .map(|k| k.candle),
+            );
+        }
+    }
+    Ok(candles)
+}
+
+/// Start of the bootstrap window: one candle more than needed, so that
+/// exactly `n` closed candles are found when `start` is inside a candle.
+fn bootstrap_from(start: DateTime<Utc>, timeframe: Timeframe, n: usize) -> DateTime<Utc> {
+    let n = i32::try_from(n).unwrap_or(i32::MAX - 1);
+    start - timeframe.duration() * (n + 1)
+}
+
+/// Candles newer than `last_open`, in order, without duplicates.
+fn new_candles(candles: Vec<Candle>, last_open: Option<DateTime<Utc>>) -> Vec<Candle> {
+    let mut last = last_open;
+    let mut out = Vec::new();
+    for c in candles {
+        if last.is_none_or(|l| c.open_time > l) {
+            last = Some(c.open_time);
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[derive(Clone)]
+struct Fetcher {
     client: reqwest::Client,
     rest_url: String,
     asset: String,
     timeframe: Timeframe,
-    sender: SourceSender<Candle>,
-    /// Open time of the last candle sent (dedup and gap detection).
-    last_open: Option<DateTime<Utc>>,
-    /// Only candles closed before this time are sent (history-only mode).
-    end: Option<DateTime<Utc>>,
+    name: String,
 }
 
-impl Feed {
+impl Fetcher {
     fn log(&self, msg: &str) {
-        eprintln!("[{}] {msg}", self.sender.info());
+        eprintln!("[{}] {msg}", self.name);
     }
 
-    /// Send a candle unless it is a duplicate or out of order.
-    /// Waits while the channel is full (backpressure from the consumer).
-    async fn emit(&mut self, candle: Candle) -> Flow {
-        if self.last_open.is_some_and(|last| candle.open_time <= last) {
-            return Flow::Continue;
-        }
-        self.last_open = Some(candle.open_time);
-        if self.sender.send(candle).await {
-            Flow::Continue
-        } else {
-            Flow::ConsumerGone
-        }
-    }
-
-    /// Send every closed candle from `from` to now (or to `end`), over REST.
-    async fn backfill(&mut self, mut from: DateTime<Utc>) -> Result<Flow, SourceError> {
+    /// Closed candles (closed before `now`) opening in `[from, until)`,
+    /// page by page, given to `each` (which returns `false` to stop).
+    async fn range(
+        &self,
+        mut from: DateTime<Utc>,
+        until: DateTime<Utc>,
+        now: DateTime<Utc>,
+        mut each: impl FnMut(Candle) -> bool + Send,
+    ) -> Result<(), SourceError> {
         loop {
             let rows = self.fetch_klines(Some(from), PAGE_LIMIT).await?;
-            let now = Utc::now();
-            let limit = self.end.map_or(now, |end| end.min(now));
-            let full_page = rows.len() == PAGE_LIMIT;
+            let full = rows.len() == PAGE_LIMIT;
             let Some(last) = rows.last().map(|k| k.candle.open_time) else {
-                return Ok(Flow::Continue);
+                return Ok(());
             };
-            for kline in rows {
-                if kline.close_time >= limit {
-                    return Ok(Flow::Continue); // still forming, or after `end`
+            for k in rows {
+                if k.candle.open_time >= until || k.close_time >= now {
+                    return Ok(());
                 }
-                if self.emit(kline.candle).await == Flow::ConsumerGone {
-                    return Ok(Flow::ConsumerGone);
+                if !each(k.candle) {
+                    return Ok(());
                 }
             }
-            if !full_page {
-                return Ok(Flow::Continue);
+            if !full {
+                return Ok(());
             }
             from = last + self.timeframe.duration();
-        }
-    }
-
-    /// Read the WebSocket until it disconnects.
-    async fn live<S>(&mut self, mut ws: S) -> Result<Flow, SourceError>
-    where
-        S: tokio_stream::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-            + Unpin,
-    {
-        // Fill the gap since the last candle sent (reconnection).
-        if let Some(last) = self.last_open
-            && self.backfill(last + self.timeframe.duration()).await? == Flow::ConsumerGone
-        {
-            return Ok(Flow::ConsumerGone);
-        }
-        loop {
-            let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws.next()).await {
-                Err(_) => {
-                    self.log("no data received, reconnecting");
-                    return Ok(Flow::Disconnected);
-                }
-                Ok(None) => return Ok(Flow::Disconnected),
-                Ok(Some(Err(e))) => {
-                    self.log(&format!("websocket error: {e}"));
-                    return Ok(Flow::Disconnected);
-                }
-                Ok(Some(Ok(msg))) => msg,
-            };
-            let text = match msg {
-                Message::Text(text) => text,
-                Message::Close(_) => return Ok(Flow::Disconnected),
-                _ => continue, // ping/pong handled by tungstenite
-            };
-            let candle = match parse_ws_kline(text.as_str()) {
-                Ok(Some(candle)) => candle,
-                Ok(None) => continue, // candle not closed yet
-                Err(e) => {
-                    self.log(&e.to_string());
-                    continue;
-                }
-            };
-            // Missing candles between the last one sent and this one: fetch them.
-            if let Some(last) = self.last_open
-                && candle.open_time > last + self.timeframe.duration()
-                && self.backfill(last + self.timeframe.duration()).await? == Flow::ConsumerGone
-            {
-                return Ok(Flow::ConsumerGone);
-            }
-            if self.emit(candle).await == Flow::ConsumerGone {
-                return Ok(Flow::ConsumerGone);
-            }
         }
     }
 
@@ -398,7 +472,7 @@ impl Fetch {
     }
 }
 
-// ------------------------------------------------------------------ parsing
+// ---------------------------------------------------------------- parsing
 
 /// A candle with its close time (to tell whether it is closed).
 #[derive(Debug, PartialEq)]
@@ -451,61 +525,26 @@ fn parse_rest_row(row: &[Value]) -> Result<Kline, SourceError> {
     })
 }
 
-#[derive(Deserialize)]
-struct WsEvent {
-    k: WsKline,
-}
-
-#[derive(Deserialize)]
-struct WsKline {
-    #[serde(rename = "t")]
-    open_time: i64,
-    #[serde(rename = "o")]
-    open: String,
-    #[serde(rename = "h")]
-    high: String,
-    #[serde(rename = "l")]
-    low: String,
-    #[serde(rename = "c")]
-    close: String,
-    #[serde(rename = "v")]
-    volume: String,
-    #[serde(rename = "x")]
-    closed: bool,
-}
-
-/// Parse a WebSocket kline event. Returns `None` if the candle is not closed.
-fn parse_ws_kline(text: &str) -> Result<Option<Candle>, SourceError> {
-    let event: WsEvent = serde_json::from_str(text).map_err(|e| bad(e.to_string()))?;
-    let k = event.k;
-    if !k.closed {
-        return Ok(None);
-    }
-    Ok(Some(Candle {
-        open_time: millis(k.open_time)?,
-        open: decimal(&k.open)?,
-        high: decimal(&k.high)?,
-        low: decimal(&k.low)?,
-        close: decimal(&k.close)?,
-        volume: decimal(&k.volume)?,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    // Hand-written samples following the documented Binance formats.
+    // Hand-written sample following the documented Binance format.
     const REST: &str = r#"[
         [1700000000000,"150.10","151.00","149.50","150.80","1234.5",1700000059999,"0",10,"0","0","0"],
         [1700000060000,"150.80","152.25","150.70","152.00","987.25",1700000119999,"0",12,"0","0","0"]
     ]"#;
 
-    fn ws(closed: bool) -> String {
-        format!(
-            r#"{{"e":"kline","E":1700000060001,"s":"SOLUSDT","k":{{"t":1700000000000,"T":1700000059999,"s":"SOLUSDT","i":"1m","o":"150.10","c":"150.80","h":"151.00","l":"149.50","v":"1234.5","x":{closed}}}}}"#
-        )
+    fn candle(min: i64) -> Candle {
+        Candle {
+            open_time: DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(min),
+            open: dec!(1),
+            high: dec!(1),
+            low: dec!(1),
+            close: dec!(1),
+            volume: dec!(1),
+        }
     }
 
     #[test]
@@ -531,22 +570,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_closed_ws_kline() {
-        let candle = parse_ws_kline(&ws(true)).unwrap().unwrap();
-        assert_eq!(candle.open_time.timestamp_millis(), 1_700_000_000_000);
-        assert_eq!(candle.close, dec!(150.80));
-        assert_eq!(candle.volume, dec!(1234.5));
+    fn new_candles_skips_duplicates_and_old_ones() {
+        let got = new_candles(
+            vec![candle(1), candle(2), candle(2), candle(3)],
+            Some(candle(1).open_time),
+        );
+        let times: Vec<_> = got.iter().map(|c| c.open_time).collect();
+        assert_eq!(times, [candle(2).open_time, candle(3).open_time]);
+        assert_eq!(new_candles(vec![candle(5)], None).len(), 1);
     }
 
     #[test]
-    fn ignores_forming_ws_kline() {
-        assert_eq!(parse_ws_kline(&ws(false)).unwrap(), None);
+    fn bootstrap_window_has_one_spare_candle() {
+        let start = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(100);
+        assert_eq!(
+            bootstrap_from(start, Timeframe::M15, 22),
+            start - TimeDelta::minutes(15 * 23)
+        );
     }
 
     #[test]
-    fn source_info_is_uppercase_symbol() {
-        let mut src = BinanceSource::new("solusdt", Timeframe::M1);
-        let stream = src.get_source_stream().unwrap();
-        assert_eq!(stream.info().to_string(), "binance:SOLUSDT:1m");
+    fn modes_follow_the_configuration() {
+        let live = BinanceSource::new("solusdt", Timeframe::M1);
+        assert_eq!(live.info().to_string(), "binance:SOLUSDT:1m");
+        assert_eq!(live.mode(), Mode::Normal);
+        assert_eq!(live.with_bootstrap(10).mode(), Mode::Bootstrap);
+        let t = DateTime::<Utc>::UNIX_EPOCH;
+        let replay = BinanceSource::new("SOLUSDT", Timeframe::M15).replay(t, t);
+        assert_eq!(replay.mode(), Mode::Replay);
     }
 }

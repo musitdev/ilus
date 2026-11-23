@@ -2,18 +2,19 @@
 //! trade markers in a native window (spec F7, cargo feature `chart`).
 //!
 //! ```text
-//! source ──> Chart ──(forwards every item)──> condition ──> action
-//!              ^                                              │
-//!              └──────────── ChartModifier::Marker ───────────┘
+//!            ┌──> Chart  (side branch: fan-out, nothing downstream needed)
+//! source ──> RSI ──> condition ──> action
+//!                                     │ ChartModifier::Marker
+//!            Chart <──────────────────┘
 //! ```
 //!
 //! - [`chart`] creates the transformer ([`Chart`]) and the window ([`ChartWindow`]).
 //! - The transformer forwards its input (like every transformer) and sends each
 //!   candle to the window.
-//! - Actions send buy/sell markers with [`ChartModifier::Marker`] through
-//!   [`Transformed::modifier_sender`](crate::transformer::Transformed::modifier_sender).
+//! - Actions send trade markers with [`ChartModifier::Marker`] through a
+//!   handle from [`Graph::modifier_handle`](crate::graph::Graph::modifier_handle).
 //! - [`ChartWindow::run`] must be called on the **main thread** (GUI requirement);
-//!   run the bot in another thread.
+//!   run the executor in another thread.
 //!
 //! Prices are converted to `f64` for display only.
 
@@ -33,7 +34,7 @@ use rust_decimal::prelude::ToPrimitive;
 use crate::candle::Candle;
 use crate::error::ModifierError;
 use crate::modifier::ModifierValue;
-use crate::source::SourceData;
+use crate::source::{Item, SourceData};
 use crate::transformer::{Derived, Transformer};
 
 /// Items the chart can display: a candle and an optional indicator value.
@@ -245,7 +246,8 @@ impl<I: ChartData> Transformer for Chart<I> {
         0
     }
 
-    fn on_data(&mut self, item: &I) -> Option<()> {
+    fn on_data(&mut self, item: Item<'_, I>) -> Option<()> {
+        let item = item.data;
         let c = item.candle();
         // If the window was closed, keep forwarding data anyway.
         let _ = self.tx.send(Msg::Candle {
@@ -631,6 +633,13 @@ mod tests {
     use chrono::TimeDelta;
     use rust_decimal_macros::dec;
 
+    fn replay<D>(data: &D) -> Item<'_, D> {
+        Item {
+            data,
+            mode: crate::source::Mode::Replay,
+        }
+    }
+
     fn candle(i: i64, close: Decimal) -> Candle {
         Candle {
             open_time: DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(i),
@@ -649,7 +658,7 @@ mod tests {
             data: candle(1, dec!(100)),
             value: Some(dec!(42)),
         };
-        assert_eq!(chart.on_data(&item), Some(()));
+        assert_eq!(chart.on_data(replay(&item)), Some(()));
         chart
             .on_modifier(ChartModifier::Marker(Marker {
                 time: item.data.open_time,
@@ -685,7 +694,7 @@ mod tests {
     fn keeps_forwarding_when_window_is_closed() {
         let (mut chart, window) = chart::<Candle>("test", "");
         drop(window);
-        assert_eq!(chart.on_data(&candle(1, dec!(10))), Some(()));
+        assert_eq!(chart.on_data(replay(&candle(1, dec!(10)))), Some(()));
     }
 
     fn point(x: f64, low: f64, high: f64) -> CandlePoint {

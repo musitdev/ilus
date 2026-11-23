@@ -9,7 +9,7 @@
 //! A call never blocks: network work runs in the background inside the source.
 //! Every item carries the running [`Mode`] of the source.
 
-// pub mod binance; // migrated in step 2
+pub mod binance;
 pub mod mock;
 
 use std::fmt;

@@ -1,15 +1,14 @@
-//! Event queue and backpressure: what happens when the action is slower than the feed.
+//! A slow action makes the tick longer: nothing is queued, nothing is lost.
 //!
 //! ```text
-//! MockSource (1 candle / 100 ms) ──> EveryCandle ──queue (max 3)──> Slow (350 ms, fails on 2nd run)
+//! MockSource ──> EveryCandle ──> Slow (300 ms, fails on its 2nd run)
 //! ```
 //!
-//! Every candle matches. What to check in the output:
-//! - no event is lost: the action processes every candle, in order;
-//! - while the queue holds fewer than 3 events, the condition keeps reading;
-//! - when 3 events are pending, the condition stops reading ("paused") until the
-//!   queue is empty, then resumes: the source is slowed down;
-//! - a failing action is logged and the next event is processed anyway.
+//! Every candle matches. A tick is sequential (source, condition, actions,
+//! modifiers), and the executor awaits each action. What to check:
+//! - "action start" / "action end" always come before the next candle;
+//! - the time between two candles is the tick (10 ms) plus the action (300 ms);
+//! - a failing action is logged and the next tick continues normally.
 //!
 //! Run with: `cargo run --example flow_slow_action`
 
@@ -17,16 +16,16 @@ mod common;
 
 use std::time::Duration;
 
-use common::{idx, log, mock};
-use ilus::action::{Action, EventOf};
-use ilus::bot::Bot;
+use common::{idx, log};
+use ilus::action::{Action, ActionContext};
 use ilus::candle::Candle;
 use ilus::condition::Condition;
 use ilus::error::{ActionError, ModifierError};
-use ilus::modifier::{ModifierSender, NoModifier};
-use ilus::rule::Rule;
-use ilus::source::Source;
-use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
+use ilus::executor::Executor;
+use ilus::graph::Graph;
+use ilus::modifier::NoModifier;
+use ilus::source::Item;
+use ilus::trigger::{Detection, TriggerEvent, TriggerEventType, TriggerValue};
 
 /// Matches every candle.
 struct EveryCandle;
@@ -40,36 +39,38 @@ impl Condition for EveryCandle {
     type Value = CandleIdx;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, c: &Candle) -> Option<Detection<CandleIdx>> {
-        log("condition", format!("candle #{} matches", idx(c)));
+    fn warm_up(&self) -> usize {
+        0
+    }
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Detection<CandleIdx>> {
+        log("condition", format!("candle #{} matches", idx(item.data)));
         Some(Detection {
             event_type: TriggerEventType::Other("every"),
-            value: CandleIdx(idx(c)),
+            value: CandleIdx(idx(item.data)),
         })
     }
-
     fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
         match m {}
     }
 }
 
-/// Takes 350 ms; the 2nd run fails.
+/// Takes 300 ms (async); the 2nd run fails.
 struct Slow {
     runs: u32,
 }
 
-impl Action<EveryCandle> for Slow {
+impl Action for Slow {
+    type Value = CandleIdx;
+    type Input = Candle;
+
     async fn run(
         &mut self,
-        event: EventOf<EveryCandle>,
-        _modifiers: &ModifierSender<NoModifier>,
+        event: TriggerEvent<'_, CandleIdx, Candle>,
+        _ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
         self.runs += 1;
-        log(
-            "action",
-            format!("start  (candle #{}) run {}", event.value.0, self.runs),
-        );
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        log("action", format!("start  (candle #{})", event.value.0));
+        tokio::time::sleep(Duration::from_millis(300)).await;
         if self.runs == 2 {
             log("action", "end    -> FAILED");
             return Err(ActionError::Failed("simulated failure".into()));
@@ -80,22 +81,12 @@ impl Action<EveryCandle> for Slow {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut bot = Bot::new();
-    let mut src = mock("BTCUSDT", &[1, 2, 3, 4, 5, 6, 7, 8], 100);
+async fn main() {
+    let mut g = Graph::new();
+    let src = g.source(common::replay("BTCUSDT", &[1, 2, 3, 4, 5]));
+    let every = g.condition("every", EveryCandle, &src);
+    g.action(Slow { runs: 0 }, &every);
 
-    bot.rule(
-        Rule::new(
-            "every",
-            src.get_source_stream()?,
-            EveryCandle,
-            Slow { runs: 0 },
-        )
-        .with_max_pending(3),
-    );
-    bot.source(src);
-
-    bot.run().await;
+    Executor::new(g).run().await;
     log("main", "done");
-    Ok(())
 }
