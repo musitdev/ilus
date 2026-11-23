@@ -79,7 +79,7 @@ Executor::new(g).run().await;
 - **Typed builder**: every builder call returns a typed handle (`Output<T>`); connecting an entity to an output of the wrong type is a **compile error**. Internally the executor stores nodes as trait objects (`dyn`), the only way to hold hundreds of entities of different types.
 - **Fan-out**: an output can feed any number of transformers and conditions; consumers read the item **by reference** (no copy).
 - A transformer or a condition has **exactly one input**. To combine or split data, special **merge / split sources** produce a new source from existing ones (e.g. merge SOL 15m and SOL 1h, then connect an RSI condition to the merged source).
-- A condition can feed **several actions**. An action has **one input value type**, defined by the action; it can be connected to several conditions producing that type.
+- A condition can feed **several actions**. An action is connected to **exactly one condition**, and has one input value type, defined by the action. If two conditions need the same behaviour, each gets **its own action instance**. Actions can have state (e.g. a simulated wallet), private to the instance.
 - The graph is acyclic by construction (an entity can only be connected to existing outputs). Modifiers are not edges: they go back from actions to a condition or a transformer through a typed handle.
 - There is no `Rule` and no channel between entities anymore.
 
@@ -386,7 +386,7 @@ struct Executor { /* graph, source schedules, modifiers of the current tick */ }
 
 **Behavior:**
 - An action receives a trigger event and executes.
-- An action has one input value type and is connected to one or more conditions producing it. It can be **async**; the executor awaits it within the tick (§5.5). Network work is started in its own task so the tick is not blocked.
+- An action is connected to **exactly one condition** and has one input value type. Two conditions needing the same behaviour use two instances. An action can keep **state** between events (e.g. a simulated wallet). It can be **async**; the executor awaits it within the tick (§5.5). Network work is started in its own task so the tick is not blocked.
 - Events are processed one at a time, in detection order, within the tick.
 - While running, an action may send **modifiers** to a condition or a transformer (F5), through handles given when the graph is built.
 - Actions of a tick run after all conditions of that tick, in graph order.
@@ -542,7 +542,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 - **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs fully sequential ticks (sources → transformers and conditions → actions → modifiers). Transformers and conditions are sync; actions can be async and are awaited (network work in their own task). No `Rule`, no channels between entities, no event queue.
 - Running modes carried in the data, set by the source: bootstrap (warm-up, no action events), replay (history with action events), normal (live).
 - Ticks: bootstrap and replay share a global 10 ms tick (one item per source, sources called in graph order); normal mode is aligned on candle close (+2 s), then every half period.
-- One input per transformer and per condition; merge / split sources combine data. Fan-out allowed: one output feeds many consumers, read by reference. An action has one input value type.
+- One input per transformer and per condition; merge / split sources combine data. Fan-out allowed: one output feeds many consumers, read by reference. An action is connected to exactly one condition (one instance per condition) and can have state.
 - Bootstrap length computed from the graph: max over downstream paths of the sum of the warm-ups.
 - Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the end of the tick, after the actions; in memory only.
 - Binance data over REST only (bootstrap/replay by pages, live polling); no WebSocket.
