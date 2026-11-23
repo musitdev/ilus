@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 use crate::candle::Candle;
 use crate::error::{ModifierError, ParameterError};
 use crate::modifier::NoModifier;
+use crate::source::Item;
 use crate::transformer::{Derived, Transformer};
 
 /// Default RSI period.
@@ -82,7 +83,8 @@ impl Transformer for Rsi {
         self.period + 1
     }
 
-    fn on_data(&mut self, candle: &Candle) -> Option<Decimal> {
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Decimal> {
+        let candle = item.data;
         let prev = self.prev_close.replace(candle.close)?;
         let change = candle.close - prev;
         let (gain, loss) = if change > Decimal::ZERO {
@@ -141,7 +143,13 @@ mod tests {
     fn run(rsi: &mut Rsi, closes: &[Decimal]) -> Vec<Option<Decimal>> {
         candles(closes)
             .iter()
-            .map(|c| rsi.on_data(c).map(|v| v.round_dp(8)))
+            .map(|c| {
+                rsi.on_data(Item {
+                    data: c,
+                    mode: crate::source::Mode::Replay,
+                })
+                .map(|v| v.round_dp(8))
+            })
             .collect()
     }
 

@@ -11,9 +11,6 @@ pub enum SourceError {
     /// The requested asset or timeframe is not available.
     #[error("unknown asset or timeframe: {0}")]
     Unknown(String),
-    /// The stream of this source was already taken (one consumer per source).
-    #[error("stream of source {0} already taken")]
-    StreamTaken(String),
 }
 
 /// Invalid parameter given to a building block (e.g. RSI period 0).
@@ -38,23 +35,7 @@ pub enum ModifierError {
     /// The condition rejected the modifier; it is left unchanged.
     #[error("modifier rejected: {0}")]
     Rejected(String),
-    /// The target condition is no longer running.
-    #[error("target condition stopped")]
+    /// The target is no longer running.
+    #[error("modifier target stopped")]
     TargetStopped,
-}
-
-/// Top-level error returned by the bot's tasks.
-#[derive(Debug, Error)]
-pub enum Error {
-    /// A source failed.
-    #[error(transparent)]
-    Source(#[from] SourceError),
-    /// A rule failed (e.g. its action task panicked).
-    #[error("rule '{rule}' failed: {reason}")]
-    Rule {
-        /// Name of the failing rule.
-        rule: String,
-        /// What went wrong.
-        reason: String,
-    },
 }

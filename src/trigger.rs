@@ -4,7 +4,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 
-use crate::source::{SourceData, SourceInfo};
+use crate::source::{Mode, SourceInfo};
 
 /// Value produced by a condition when it triggers. Its meaning is specific
 /// to the condition algorithm (e.g. a buy/sell signal), not to the source data.
@@ -57,19 +57,23 @@ pub struct Detection<V> {
     pub value: V,
 }
 
-/// Event sent to an action when a condition triggers.
+/// Event given to an action when its condition triggers (never for bootstrap
+/// items). The action is awaited within the tick, so the event borrows the
+/// detection value and the triggering item.
 #[derive(Debug)]
-pub struct TriggerEvent<V: TriggerValue, D: SourceData> {
-    /// Rule that produced it.
-    pub rule: String,
+pub struct TriggerEvent<'a, V, D> {
+    /// Name of the condition node.
+    pub condition: &'a str,
     /// What was detected.
     pub event_type: TriggerEventType,
     /// Condition-specific value (e.g. buy signal).
-    pub value: V,
-    /// Where the data came from.
-    pub source: SourceInfo,
-    /// Time of the triggering data item.
+    pub value: &'a V,
+    /// Where the data came from (the condition input).
+    pub source: &'a SourceInfo,
+    /// Time of the triggering item.
     pub time: DateTime<Utc>,
-    /// Triggering data item (context only).
-    pub data: D,
+    /// Running mode of the triggering item (replay or normal).
+    pub mode: Mode,
+    /// The triggering item (the condition input).
+    pub data: &'a D,
 }
