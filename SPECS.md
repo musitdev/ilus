@@ -78,7 +78,7 @@ Executor::new(g).run().await;
 
 - **Typed builder**: every builder call returns a typed handle (`Output<T>`); connecting an entity to an output of the wrong type is a **compile error**. Internally the executor stores nodes as trait objects (`dyn`), the only way to hold hundreds of entities of different types.
 - **Fan-out**: an output can feed any number of transformers and conditions; consumers read the item **by reference** (no copy).
-- A transformer or a condition has **exactly one input**. To combine or split data, special **merge / split sources** produce a new source from existing ones (e.g. merge SOL 15m and SOL 1h, then connect an RSI condition to the merged source).
+- A transformer or a condition has **exactly one input**. To combine data, a **merge source** builds a new source from two existing ones (e.g. merge SOL 15m and SOL 1h, then connect a condition to the merged source); it is the only node with two inputs (F1). Splitting needs no special node: it is fan-out.
 - A condition can feed **several actions**. An action is connected to **exactly one condition**, and has one input value type, defined by the action. If two conditions need the same behaviour, each gets **its own action instance**. Actions can have state (e.g. a simulated wallet), private to the instance.
 - The graph is acyclic by construction (an entity can only be connected to existing outputs). Modifiers are not edges: they go back from actions to a condition or a transformer through a typed handle.
 - There is no `Rule` and no channel between entities anymore.
@@ -332,10 +332,15 @@ struct Executor { /* graph, tick, clock */ }
 - A **transformed source** is defined by an input source, a transformer and its parameters (see F4). It inherits the asset and timeframe of its input.
 - A source is added once to the graph; its output can feed any number of consumers (fan-out, §5.1), with a single connection to the provider.
 - Provider sources deliver **candles only** (price and volume). Other provider data (order book, trades, external indicators) is out of scope for now. Derived data (e.g. RSI) is produced by transformers.
-- The timeframe is requested directly from the provider (ilus does not aggregate candles). It is fixed at startup and does not change while running.
+- The timeframe of a provider source is requested directly from the provider and fixed at startup. Longer timeframes can also be built from it with the **aggregation transformer** (F4).
 - Modes (§5.3): **bootstrap** warms up with the last closed candles before the start (length computed from the graph, §5.4, or more with `with_bootstrap(n)`; no action events); then either live data (**normal**), or `replay(from, to)`: every candle of the period, with action events, after which the source ends.
 - A source signals whether a candle is closed; only closed candles are passed to conditions (see F0).
-- **Merge / split sources** (to be defined): build a new source from existing ones, e.g. merge two timeframes of the same asset for a condition that needs both.
+- **Merge source**: combines two inputs, a *driving* one (e.g. 15m) and a *slower* one (e.g. 1h), into one source.
+  - It emits on **each item of the driving input**: `Merged { main: 15m item, other: Option<1h item> }`. The same 1h value is sent again with every 15m item until a newer one is available; `None` before the first one.
+  - Items are paired **by time, not by tick**: the slower value is the last item of the slower input **closed at or before the close of the driving item** (no look-ahead: for the 15m candle 10:15–10:30, the 1h candle 09:00–10:00, not 10:00–11:00). In bootstrap and replay the inputs are not time-aligned (one item per source per tick, §5.4), so the merge buffers the items of the slower input until they are needed.
+  - The merged item has the running mode of the driving item. Within a tick all sources are called before the nodes, so in normal mode a slower candle closing at the same time as a driving candle is already available.
+  - Bootstrap: each input gets the bootstrap length computed for the paths downstream of the merge (§5.4), counted in its own items.
+- **Split**: no special node. An output can feed any number of consumers (fan-out, §5.1), which all read the same item by reference, i.e. a shared reference to the value produced by the input.
 
 **Default source:**
 - A free, public crypto feed that requires no account or API key.
@@ -418,6 +423,11 @@ struct Executor { /* graph, tick, clock */ }
 - During **warm-up** (not enough input yet, e.g. the first 14 changes for RSI 14), the value is `None`; the input item is still forwarded.
 - The transformed source inherits the asset and timeframe of its input.
 - Its output can feed any number of consumers (fan-out); it is computed once per item. Its items keep the running mode of the input (§5.3).
+
+**Aggregation transformer** (e.g. 1m → 5m):
+- Builds candles of a longer timeframe from the input candles, on boundaries aligned to the clock (00:00, 00:05, …): open of the first candle, highest high, lowest low, close of the last one, sum of volumes.
+- It emits on **each input candle**: `Derived { data: 1m candle, value: Option<5m candle> }`, where the value is the **last completed** 5m candle, sent again until the next one completes (`None` before the first one). A 5m candle is completed by the 1m candle that closes its period; the 5m candle still forming is never sent (closed data only).
+- Warm-up: the ratio between the two timeframes (5 for 1m → 5m).
 - It declares its warm-up (`warm_up()`), used to compute the source bootstrap length (§5.4).
 - A transformer only sees data items and modifiers; it knows nothing about conditions or actions.
 - A transformer may accept **modifiers** (F5), applied at the end of the tick in which they are produced (§5.5). Its modifier handle is obtained from the graph builder and given to actions.
@@ -551,7 +561,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 - **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs fully sequential ticks (sources → transformers and conditions → actions → modifiers). Transformers and conditions are sync; actions can be async and are awaited (network work in their own task). No `Rule`, no channels between entities, no event queue.
 - Running modes carried in the data, set by the source: bootstrap (warm-up, no action events), replay (history with action events), normal (live).
 - Ticks: bootstrap and replay share a global 10 ms tick (one item per source, sources called in graph order); normal mode is aligned on candle close (+2 s), then every half period.
-- One input per transformer and per condition; merge / split sources combine data. Fan-out allowed: one output feeds many consumers, read by reference. An action is connected to exactly one condition (one instance per condition) and can have state.
+- One input per transformer and per condition; a merge source (two inputs, paired by time without look-ahead) combines data; split is fan-out; an aggregation transformer builds longer timeframes. Fan-out allowed: one output feeds many consumers, read by reference. An action is connected to exactly one condition (one instance per condition) and can have state.
 - Bootstrap length computed from the graph: max over downstream paths of the sum of the warm-ups.
 - Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the end of the tick, after the actions; in memory only.
 - Binance data over REST only (bootstrap/replay by pages, live polling); no WebSocket.
@@ -569,7 +579,4 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 - ~~Value of N~~ → resolved: 5 retries with exponential backoff (1 s → 60 s).
 - If several patterns match the same candle in one condition, which event is emitted: the first by table order, one event listing all matches, or one condition instance per pattern?
 - Modifier senders: "mostly by actions". Who else can send them: other conditions, an external command (CLI), a timer?
-- Merge source (e.g. 15m + 1h): when does it emit (on each input item, or when both have a new item), and how are items paired, given that bootstrap and replay sources are not time-aligned (§5.4)?
-- Split source: what does it split (e.g. one item into several sources)?
-- Could a transformer aggregate candles (e.g. 1m → 5m)? This conflicts with the current decision that timeframes come from the provider.
 - RSI: confirm defaults (`period` 14, on close, Wilder smoothing) and the rounding of the output.
