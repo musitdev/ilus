@@ -1,0 +1,31 @@
+[package]
+name = "ilus"
+version = "0.1.0"
+edition = "2024"
+description = "Market-monitoring bot: source -> condition -> action pipeline"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+chrono = "0.4.45"
+eframe = { version = "0.37.0", optional = true }
+egui_plot = { version = "0.38.0", optional = true }
+reqwest = { version = "0.13", features = ["query"] }
+rust_decimal = "1.43.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+
+[[example]]
+name = "chart_futures"
+required-features = ["chart"]
+
+[dev-dependencies]
+rust_decimal_macros = "1.40.0"
+tokio = { version = "1.54.1", features = ["test-util", "rt", "macros"] }
+
+[features]
+# Native chart window (transformer::chart).
+chart = ["dep:eframe", "dep:egui_plot"]
