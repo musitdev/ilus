@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use crate::condition::Condition;
 use crate::error::{ModifierError, ParameterError};
 use crate::modifier::NoModifier;
-use crate::source::Timeframe;
+use crate::source::{Item, Timeframe};
 use crate::transformer::rsi::RsiCandle;
 use crate::trigger::{Detection, TriggerEventType, TriggerValue};
 
@@ -190,7 +190,12 @@ impl Condition for RsiDivergence {
     type Value = Divergence;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, item: &RsiCandle) -> Option<Detection<Divergence>> {
+    fn warm_up(&self) -> usize {
+        self.params.left + 1 + self.params.right
+    }
+
+    fn on_data(&mut self, item: Item<'_, RsiCandle>) -> Option<Detection<Divergence>> {
+        let item = item.data;
         let c = &item.data;
         self.window.push_back(Bar {
             time: c.open_time,
@@ -253,7 +258,10 @@ impl Condition for RsiDivergence {
         })
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }
@@ -316,7 +324,13 @@ mod tests {
         items
             .iter()
             .enumerate()
-            .filter_map(|(i, it)| cond.on_data(it).map(|d| (i, d)))
+            .filter_map(|(i, it)| {
+                cond.on_data(Item {
+                    data: it,
+                    mode: crate::source::Mode::Replay,
+                })
+                .map(|d| (i, d))
+            })
             .collect()
     }
 

@@ -1,23 +1,23 @@
-//! Helpers shared by the `flow_*` examples.
+//! Helpers shared by the `flow_*` examples and `simple`.
 #![allow(dead_code)] // each example uses a subset
 
 use std::fmt::Display;
+use std::marker::PhantomData;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use ilus::action::{Action, EventOf};
+use ilus::action::{Action, ActionContext};
 use ilus::candle::Candle;
-use ilus::condition::Condition;
 use ilus::error::ActionError;
-use ilus::modifier::ModifierSender;
-use ilus::source::Timeframe;
 use ilus::source::mock::MockSource;
+use ilus::source::{SourceData, Timeframe};
+use ilus::trigger::{TriggerEvent, TriggerValue};
 use rust_decimal::Decimal;
 
 static START: OnceLock<Instant> = OnceLock::new();
 
-/// Print a timeline line: elapsed time, who, message.
+/// Print a timeline line: elapsed real time, who, message.
 pub fn log(who: &str, msg: impl Display) {
     let ms = START.get_or_init(Instant::now).elapsed().as_millis();
     println!("[{ms:>5}ms] {who:<12} | {msg}");
@@ -42,11 +42,10 @@ pub fn candles(closes: &[i64]) -> Vec<Candle> {
         .collect()
 }
 
-/// Mock candle source sending one candle every `every_ms` milliseconds.
-pub fn mock(asset: &str, closes: &[i64], every_ms: u64) -> MockSource<Candle> {
+/// Mock source replaying candles with the given closes (1m).
+pub fn replay(asset: &str, closes: &[i64]) -> MockSource<Candle> {
     START.get_or_init(Instant::now);
-    MockSource::new(asset, Timeframe::M1, candles(closes))
-        .with_interval(Duration::from_millis(every_ms))
+    MockSource::replay(asset, Timeframe::M1, candles(closes))
 }
 
 /// Candle index (minutes since the epoch), to identify candles in logs.
@@ -54,20 +53,35 @@ pub fn idx(c: &Candle) -> i64 {
     c.open_time.timestamp() / 60
 }
 
-/// Action logging the event it receives. Works with any condition.
-pub struct LogAction;
+/// Action logging the events it receives. Works with any condition.
+pub struct LogAction<V, D> {
+    name: &'static str,
+    types: PhantomData<fn(V, D)>,
+}
 
-impl<C: Condition> Action<C> for LogAction {
-    async fn run(
+impl<V, D> LogAction<V, D> {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            types: PhantomData,
+        }
+    }
+}
+
+impl<V: TriggerValue, D: SourceData> Action for LogAction<V, D> {
+    type Value = V;
+    type Input = D;
+
+    fn run(
         &mut self,
-        event: EventOf<C>,
-        _modifiers: &ModifierSender<C::Modifier>,
+        event: TriggerEvent<'_, V, D>,
+        _ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
         log(
-            "action",
+            self.name,
             format!(
-                "rule={} {:?} value={:?} source={}",
-                event.rule, event.event_type, event.value, event.source
+                "{} {:?} value={:?} ({:?})",
+                event.condition, event.event_type, event.value, event.mode
             ),
         );
         Ok(())

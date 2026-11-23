@@ -1,10 +1,13 @@
 //! Simulation of the RSI divergence strategy on SOL/USDT **futures** with leverage.
 //!
 //! ```text
-//! BinanceSource(SOLUSDT, tf, period) ──> Rsi(14) ──> WithTicks(RsiDivergence) ──> Futures
+//! BinanceSource(SOLUSDT, tf, replay) ──> Rsi(14) ──> WithTicks(RsiDivergence) ──┬─> Futures (fee 1)
+//!                                                                                 └─> Futures (fee 2) ...
 //! ```
 //!
 //! Rules:
+//! - before the period, the source bootstraps the candles needed to warm up
+//!   the RSI and the divergence detection (no trade during the warm-up);
 //! - capital: 10 SOL, converted to USDT at the first candle close; start flat;
 //! - bullish divergence (price minimum): close the short (if any), open a LONG;
 //! - bearish divergence (price maximum): close the long (if any), open a SHORT;
@@ -29,43 +32,42 @@
 //! The condition is wrapped so that it also emits a "tick" event for every
 //! candle: the action needs every candle to check liquidation.
 //!
+//! One futures account (action) per fee, all on the same condition. The replay
+//! runs as fast as possible (`--tick-ms 0`, the default here).
+//!
 //! Run with:
-//! `cargo run --example backtest_futures -- [--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N] [--right N] [--min-gap N] [--max-gap N] [timeframe] [fees %...]`
+//! `cargo run --example backtest_futures -- [--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N] [--right N] [--min-gap N] [--max-gap N] [--tick-ms N] [timeframe] [fees %...]`
 //! e.g. `cargo run --example backtest_futures -- --days 7 --stop 3 15m 0 0.05 0.2`
 
 #[path = "support/futures.rs"]
 mod futures;
 
 use futures::{Futures, WithTicks, parse_args};
-use ilus::bot::Bot;
 use ilus::condition::divergence::RsiDivergence;
-use ilus::rule::Rule;
-use ilus::source::Source;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
 use ilus::source::binance::BinanceSource;
-use ilus::transformer::Transformed;
 use ilus::transformer::rsi::Rsi;
 use rust_decimal::Decimal;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     println!("{}", args.header);
 
-    let mut bot = Bot::new();
+    let mut g = Graph::new();
+    let sol = g.source(BinanceSource::new("SOLUSDT", args.timeframe).replay(args.from, args.to));
+    let sol_rsi = g.transform(Rsi::new(14)?, &sol);
+    let signals = g.condition(
+        "sol-divergence",
+        WithTicks(RsiDivergence::new(args.params)?),
+        &sol_rsi,
+    );
     for &fee in &args.fees {
-        let mut sol = BinanceSource::new("SOLUSDT", args.timeframe)
-            .with_start(args.from)
-            .with_end(args.to);
-        let mut sol_rsi = Transformed::new(Rsi::new(14)?, sol.get_source_stream()?);
-        bot.rule(Rule::new(
-            format!("futures-fee-{fee}"),
-            sol_rsi.get_source_stream()?,
-            WithTicks::new(RsiDivergence::new(args.params)?),
+        g.action(
             Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ()),
-        ));
-        bot.source(sol);
-        bot.source(sol_rsi);
+            &signals,
+        );
     }
-    bot.run().await;
+    Executor::new(g).with_tick(args.tick).run()?;
     Ok(())
 }

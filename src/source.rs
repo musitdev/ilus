@@ -1,34 +1,59 @@
-//! Sources: typed streams of closed data items (spec F1).
+//! Sources: produce closed data items, one per call at most (spec §5, F1).
 //!
-//! Each source owns its own [`SourceChannel`] with exactly **one** consumer.
-//! A transformer or a rule calls [`Source::get_source_stream`] to get the
-//! [`SourceStream`] built from that channel. It can be taken only once.
+//! The [`Executor`](crate::executor::Executor) calls each source at its ticks:
+//! - in **bootstrap** and **replay** modes, at every global tick (10 ms by default);
+//! - in **normal** (live) mode, when the source asks to be called
+//!   ([`Source::next_call`]): just after the expected candle close, then every
+//!   half period until the candle is available ([`next_aligned_call`]).
 //!
-//! Channels are **bounded**: when the consumer stops reading (backpressure),
-//! the channel fills up and [`SourceSender::send`] waits, slowing the source.
+//! A call never blocks: network work runs in the background inside the source.
+//! Every item carries the running [`Mode`] of the source.
 
 pub mod binance;
+pub mod merge;
 pub mod mock;
 
 use std::fmt;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use chrono::{DateTime, TimeDelta, Utc};
-use tokio::sync::mpsc;
-use tokio_stream::Stream;
-use tokio_stream::wrappers::ReceiverStream;
 
-use crate::error::SourceError;
+/// Running mode of a source, carried by every data item (spec §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mode {
+    /// History before the start, to warm up transformers and conditions.
+    /// Detections of bootstrap items are not sent to actions.
+    Bootstrap,
+    /// History over a chosen period (backtests). Actions are run.
+    Replay,
+    /// Live data. Actions are run.
+    Normal,
+}
 
-/// Default number of items buffered in a source channel.
-pub const DEFAULT_CAPACITY: usize = 256;
-
-/// One closed, timestamped element of a source stream.
-pub trait SourceData: fmt::Debug + Send + Sync + 'static {
+/// One closed, timestamped data item.
+///
+/// `Clone` is required because a transformer output forwards (owns) its input.
+pub trait SourceData: fmt::Debug + Clone + Send + Sync + 'static {
     /// Time of the item (for candles: open time).
     fn time(&self) -> DateTime<Utc>;
 }
+
+/// A data item with its running mode, as given to transformers and conditions.
+#[derive(Debug)]
+pub struct Item<'a, D> {
+    /// The data.
+    pub data: &'a D,
+    /// Running mode of the source that produced it.
+    pub mode: Mode,
+}
+
+// Manual impls: an item only holds a reference, whatever `D` is.
+impl<D> Clone for Item<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D> Copy for Item<'_, D> {}
 
 /// Duration of one candle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,6 +73,9 @@ pub enum Timeframe {
 }
 
 impl Timeframe {
+    /// Every timeframe, shortest first.
+    pub const ALL: [Self; 6] = [Self::M1, Self::M5, Self::M15, Self::H1, Self::H4, Self::D1];
+
     /// Duration of one candle.
     pub fn duration(self) -> TimeDelta {
         match self {
@@ -58,6 +86,11 @@ impl Timeframe {
             Self::H4 => TimeDelta::hours(4),
             Self::D1 => TimeDelta::days(1),
         }
+    }
+
+    /// Parse `1m`, `5m`, `15m`, `1h`, `4h`, `1d`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tf| tf.to_string() == s)
     }
 }
 
@@ -95,6 +128,24 @@ pub enum SourceInfo {
         /// Transformer description (e.g. `rsi(14)`).
         transformer: String,
     },
+    /// Two sources merged by a [`merge::MergeSource`].
+    Merged {
+        /// The driving source.
+        main: Box<SourceInfo>,
+        /// The slower source.
+        other: Box<SourceInfo>,
+    },
+}
+
+impl SourceInfo {
+    /// Timeframe of the items (for a merge: of the driving source).
+    pub fn timeframe(&self) -> Option<Timeframe> {
+        match self {
+            Self::Provider { timeframe, .. } => Some(*timeframe),
+            Self::Transformed { input, .. } => input.timeframe(),
+            Self::Merged { main, .. } => main.timeframe(),
+        }
+    }
 }
 
 impl fmt::Display for SourceInfo {
@@ -106,116 +157,112 @@ impl fmt::Display for SourceInfo {
                 timeframe,
             } => write!(f, "{provider}:{asset}:{timeframe}"),
             Self::Transformed { input, transformer } => write!(f, "{transformer}<{input}>"),
+            Self::Merged { main, other } => write!(f, "merge<{main}, {other}>"),
         }
     }
 }
 
-/// A producer of data items.
+/// Result of a source call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourcePoll<D> {
+    /// A new closed item, with its running mode.
+    Ready(D, Mode),
+    /// No new item yet.
+    Pending,
+    /// The source has ended (e.g. end of a replay, or a fatal error).
+    Ended,
+}
+
+/// A producer of closed data items, called by the executor.
 pub trait Source: Send + 'static {
     /// Type of data item produced.
     type Data: SourceData;
 
-    /// The channel of this source.
-    fn channel(&mut self) -> &mut SourceChannel<Self::Data>;
+    /// Description of this source.
+    fn info(&self) -> SourceInfo;
 
-    /// Take the stream of this source. Only one consumer per source:
-    /// a second call returns [`SourceError::StreamTaken`].
-    fn get_source_stream(&mut self) -> Result<SourceStream<Self::Data>, SourceError> {
-        self.channel().take_stream()
-    }
+    /// Number of bootstrap items needed by the graph (computed from the
+    /// warm-ups, spec §5.4). Called once, before the first call. A source
+    /// keeps the largest of this value and the one set by the user.
+    fn set_bootstrap(&mut self, items: usize);
 
-    /// Produce items until the feed ends or fails. Only closed items must be
-    /// sent. When it returns, the sender is dropped and the stream ends.
-    fn run(self) -> impl Future<Output = Result<(), SourceError>> + Send;
+    /// Number of bootstrap items this source will deliver (as set by the
+    /// user, e.g. `with_bootstrap`, or by [`set_bootstrap`](Self::set_bootstrap)).
+    fn bootstrap(&self) -> usize;
+
+    /// Current running mode: bootstrap and replay sources are called at every
+    /// global tick; normal sources when [`next_call`](Self::next_call) is due.
+    fn mode(&self) -> Mode;
+
+    /// Next item if one is ready. Must never block.
+    fn poll(&mut self, now: DateTime<Utc>) -> SourcePoll<Self::Data>;
+
+    /// Normal mode: when the executor must call this source next.
+    fn next_call(&self, now: DateTime<Utc>) -> DateTime<Utc>;
 }
 
-/// The channel owned by a source: one sender, one receiver, bounded.
-pub struct SourceChannel<D> {
-    info: SourceInfo,
-    tx: mpsc::Sender<D>,
-    rx: Option<mpsc::Receiver<D>>,
+/// Default delay after a candle close before calling a normal-mode source.
+pub const CLOSE_DELAY: TimeDelta = TimeDelta::seconds(2);
+
+/// Normal-mode schedule (spec §5.4): call just after the close of the next
+/// expected candle (`close + delay`); if that time is past and the candle was
+/// not available, call again every half period.
+///
+/// `last_open` is the open time of the last candle delivered (`None`: call now).
+pub fn next_aligned_call(
+    last_open: Option<DateTime<Utc>>,
+    timeframe: Timeframe,
+    now: DateTime<Utc>,
+    delay: TimeDelta,
+) -> DateTime<Utc> {
+    let Some(last) = last_open else {
+        return now;
+    };
+    let tf = timeframe.duration();
+    // The next candle opens at `last + tf` and closes at `last + 2 tf`.
+    let at = last + tf * 2 + delay;
+    if now < at { at } else { now + tf / 2 }
 }
 
-impl<D: SourceData> SourceChannel<D> {
-    /// Create the channel of a source, buffering [`DEFAULT_CAPACITY`] items.
-    pub fn new(info: SourceInfo) -> Self {
-        Self::with_capacity(info, DEFAULT_CAPACITY)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(min: i64, sec: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(min) + TimeDelta::seconds(sec)
     }
 
-    /// Create the channel of a source, buffering `capacity` items (at least 1).
-    pub fn with_capacity(info: SourceInfo, capacity: usize) -> Self {
-        let (tx, rx) = mpsc::channel(capacity.max(1));
-        Self {
-            info,
-            tx,
-            rx: Some(rx),
+    #[test]
+    fn aligned_call_after_the_expected_close() {
+        let d = CLOSE_DELAY;
+        // Last candle opened at 00:00 (1m): the next one closes at 00:02.
+        assert_eq!(
+            next_aligned_call(Some(t(0, 0)), Timeframe::M1, t(1, 10), d),
+            t(2, 2)
+        );
+        // Past the expected time and still missing: every half period (30 s).
+        assert_eq!(
+            next_aligned_call(Some(t(0, 0)), Timeframe::M1, t(2, 2), d),
+            t(2, 32)
+        );
+        // 15m: the next candle closes 30 min after the last open.
+        assert_eq!(
+            next_aligned_call(Some(t(0, 0)), Timeframe::M15, t(16, 0), d),
+            t(30, 2)
+        );
+        assert_eq!(
+            next_aligned_call(Some(t(0, 0)), Timeframe::M15, t(31, 0), d),
+            t(38, 30)
+        );
+        // Nothing delivered yet: call now.
+        assert_eq!(next_aligned_call(None, Timeframe::M1, t(5, 0), d), t(5, 0));
+    }
+
+    #[test]
+    fn timeframe_round_trip() {
+        for tf in Timeframe::ALL {
+            assert_eq!(Timeframe::parse(&tf.to_string()), Some(tf));
         }
-    }
-
-    /// Description of the source.
-    pub fn info(&self) -> &SourceInfo {
-        &self.info
-    }
-
-    /// Take the receiving end as a stream (once).
-    pub fn take_stream(&mut self) -> Result<SourceStream<D>, SourceError> {
-        let rx = self
-            .rx
-            .take()
-            .ok_or_else(|| SourceError::StreamTaken(self.info.to_string()))?;
-        Ok(SourceStream {
-            info: self.info.clone(),
-            inner: ReceiverStream::new(rx),
-        })
-    }
-
-    /// Turn the channel into its sending end, for use in [`Source::run`].
-    /// If the stream was never taken, it is dropped here so nothing piles up.
-    pub fn into_sender(self) -> SourceSender<D> {
-        SourceSender {
-            info: self.info,
-            tx: self.tx,
-        }
-    }
-}
-
-/// Sending end of a source channel.
-pub struct SourceSender<D> {
-    info: SourceInfo,
-    tx: mpsc::Sender<D>,
-}
-
-impl<D> SourceSender<D> {
-    /// Description of the source.
-    pub fn info(&self) -> &SourceInfo {
-        &self.info
-    }
-
-    /// Send a closed item to the consumer. Waits while the channel is full
-    /// (backpressure). Returns `false` if there is no consumer (anymore):
-    /// the source may stop.
-    pub async fn send(&self, item: D) -> bool {
-        self.tx.send(item).await.is_ok()
-    }
-}
-
-/// Stream of a source's items, built from the source channel.
-pub struct SourceStream<D> {
-    info: SourceInfo,
-    inner: ReceiverStream<D>,
-}
-
-impl<D> SourceStream<D> {
-    /// Description of the source this stream comes from.
-    pub fn info(&self) -> &SourceInfo {
-        &self.info
-    }
-}
-
-impl<D> Stream for SourceStream<D> {
-    type Item = D;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<D>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        assert_eq!(Timeframe::parse("2m"), None);
     }
 }

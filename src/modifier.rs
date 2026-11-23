@@ -1,59 +1,82 @@
-//! Modifiers: information sent to a condition to change how it operates (spec F5).
+//! Modifiers: information sent (mostly by actions) to a condition or a
+//! transformer to change how it operates (spec F5).
+//!
+//! Modifiers are addressed with a typed [`ModifierHandle`], obtained from the
+//! [`Graph`](crate::graph::Graph) builder. They are applied by the executor at
+//! the end of the tick in which they are produced (spec §5.5).
 
+use std::any::Any;
 use std::fmt;
+use std::marker::PhantomData;
 
 use tokio::sync::mpsc;
 
 use crate::error::ModifierError;
 
-/// Information sent to a condition. Its meaning is specific to the condition.
+/// Information sent to a condition or a transformer. Its meaning is specific
+/// to the receiver.
 pub trait ModifierValue: fmt::Debug + Send + Sync + 'static {}
 
-/// Modifier type for conditions that accept no modifier (it cannot be built).
+/// Modifier type for nodes that accept no modifier (it cannot be built).
 #[derive(Debug)]
 pub enum NoModifier {}
 
 impl ModifierValue for NoModifier {}
 
-/// Messages from the action side to the rule. Modifiers and the "action done"
-/// notification (used to count queued events) share one channel, so they are
-/// handled in the order they were sent.
-pub(crate) enum Control<M> {
-    Modifier(M),
-    ActionDone,
+/// Typed address of a node that accepts modifiers of type `M`.
+pub struct ModifierHandle<M> {
+    pub(crate) node: usize,
+    pub(crate) modifier: PhantomData<fn(M)>,
 }
 
-/// Handle to send modifiers to a condition (given to the rule's action) or to
-/// a transformer ([`Transformed::modifier_sender`](crate::transformer::Transformed::modifier_sender)).
-/// Cloning it gives another handle to the same target.
-pub struct ModifierSender<M> {
-    tx: mpsc::UnboundedSender<Control<M>>,
+impl<M> Clone for ModifierHandle<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
-impl<M> Clone for ModifierSender<M> {
+impl<M> Copy for ModifierHandle<M> {}
+
+impl<M> fmt::Debug for ModifierHandle<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ModifierHandle(node {})", self.node)
+    }
+}
+
+/// A type-erased modifier addressed to a node.
+pub(crate) type Envelope = (usize, Box<dyn Any + Send>);
+
+/// Sends a modifier from a background task (e.g. started by an action for
+/// network work). It is applied at the end of the first tick after it arrives.
+pub struct DeferredModifier<M> {
+    node: usize,
+    tx: mpsc::UnboundedSender<Envelope>,
+    modifier: PhantomData<fn(M)>,
+}
+
+impl<M> Clone for DeferredModifier<M> {
     fn clone(&self) -> Self {
         Self {
+            node: self.node,
             tx: self.tx.clone(),
+            modifier: PhantomData,
         }
     }
 }
 
-impl<M: ModifierValue> ModifierSender<M> {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<Control<M>>) -> Self {
-        Self { tx }
+impl<M: ModifierValue> DeferredModifier<M> {
+    pub(crate) fn new(handle: &ModifierHandle<M>, tx: mpsc::UnboundedSender<Envelope>) -> Self {
+        Self {
+            node: handle.node,
+            tx,
+            modifier: PhantomData,
+        }
     }
 
-    /// Send a modifier. It is applied by the target between two data items,
-    /// in send order.
+    /// Send the modifier to the executor.
     pub fn send(&self, modifier: M) -> Result<(), ModifierError> {
         self.tx
-            .send(Control::Modifier(modifier))
-            .map_err(|_| ModifierError::TargetStopped)
-    }
-
-    pub(crate) fn action_done(&self) -> Result<(), ModifierError> {
-        self.tx
-            .send(Control::ActionDone)
+            .send((self.node, Box::new(modifier)))
             .map_err(|_| ModifierError::TargetStopped)
     }
 }

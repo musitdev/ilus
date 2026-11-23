@@ -1,31 +1,30 @@
-//! Simple example wiring every building block:
+//! Simple example wiring every building block in a graph:
 //!
 //! ```text
-//! MockSource A (candles) ──> CloseAbove ──> RaiseThreshold ─┐ (sends modifier)
-//!                               ^──────── SetThreshold ─────┘
-//! MockSource B (candles) ──> Sma(3) ──> SmaAbove ──> Alert
+//!                 ┌──> CloseAbove ──> RaiseThreshold ─┐ (modifier: SetThreshold)
+//! MockSource ─────┤        ^──────────────────────────┘
+//!   (candles)     └──> Sma(3) ──> SmaAbove ──> Alert
 //! ```
 //!
-//! One consumer per source: each chain has its own source.
+//! One source feeds two branches (fan-out). The first 3 candles bootstrap the
+//! SMA (warm-up): they produce no event.
 //!
 //! Run with: `cargo run --example simple`
 
-use std::collections::VecDeque;
-use std::time::Duration;
+mod common;
 
-use chrono::{DateTime, TimeDelta, Utc};
-use ilus::action::{Action, Alert, EventOf};
-use ilus::bot::Bot;
+use std::collections::VecDeque;
+
+use ilus::action::{Action, ActionContext, Alert};
 use ilus::candle::Candle;
 use ilus::condition::Condition;
-use ilus::error::SourceError;
 use ilus::error::{ActionError, ModifierError};
-use ilus::modifier::{ModifierSender, ModifierValue, NoModifier};
-use ilus::rule::Rule;
-use ilus::source::mock::MockSource;
-use ilus::source::{Source, Timeframe};
-use ilus::transformer::{Derived, Transformed, Transformer};
-use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
+use ilus::executor::Executor;
+use ilus::graph::Graph;
+use ilus::modifier::{ModifierHandle, ModifierValue, NoModifier};
+use ilus::source::Item;
+use ilus::transformer::{Derived, Transformer};
+use ilus::trigger::{Detection, TriggerEvent, TriggerEventType, TriggerValue};
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------- Condition 1
@@ -36,7 +35,6 @@ struct CloseAbove {
 
 /// Value emitted by [`CloseAbove`].
 #[derive(Debug)]
-#[allow(dead_code)] // fields are read through Debug by the alert
 struct CloseSignal {
     close: Decimal,
     threshold: Decimal,
@@ -55,21 +53,28 @@ impl Condition for CloseAbove {
     type Value = CloseSignal;
     type Modifier = CloseAboveModifier;
 
-    fn on_data(&mut self, candle: &Candle) -> Option<Detection<CloseSignal>> {
-        (candle.close > self.threshold).then_some(Detection {
+    fn warm_up(&self) -> usize {
+        0
+    }
+
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Detection<CloseSignal>> {
+        (item.data.close > self.threshold).then_some(Detection {
             event_type: TriggerEventType::Other("close_above"),
             value: CloseSignal {
-                close: candle.close,
+                close: item.data.close,
                 threshold: self.threshold,
             },
         })
     }
 
-    fn on_modifier(&mut self, modifier: CloseAboveModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        modifier: CloseAboveModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match modifier {
             CloseAboveModifier::SetThreshold(t) if t > Decimal::ZERO => {
                 self.threshold = t;
-                Ok(())
+                Ok(None)
             }
             CloseAboveModifier::SetThreshold(t) => Err(ModifierError::Rejected(format!(
                 "threshold must be > 0, got {t}"
@@ -79,25 +84,29 @@ impl Condition for CloseAbove {
 }
 
 // ------------------------------------------------------------------- Action 1
-/// Alerts, then raises the condition threshold to the triggering close + `step`.
+/// Prints, then raises the condition threshold to the triggering close + `step`.
 struct RaiseThreshold {
     step: Decimal,
+    condition: ModifierHandle<CloseAboveModifier>,
 }
 
-impl Action<CloseAbove> for RaiseThreshold {
-    async fn run(
+impl Action for RaiseThreshold {
+    type Value = CloseSignal;
+    type Input = Candle;
+
+    fn run(
         &mut self,
-        event: EventOf<CloseAbove>,
-        modifiers: &ModifierSender<CloseAboveModifier>,
+        event: TriggerEvent<'_, CloseSignal, Candle>,
+        ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
         let next = event.value.close + self.step;
         println!(
-            "[RAISE] rule={} close={} > {} -> new threshold {next}",
-            event.rule, event.value.close, event.value.threshold
+            "[RAISE] {} close={} > {} -> new threshold {next}",
+            event.condition, event.value.close, event.value.threshold
         );
-        modifiers
-            .send(CloseAboveModifier::SetThreshold(next))
-            .map_err(|e| ActionError::Failed(e.to_string()))
+        // Applied at the end of this tick: the next candle uses the new threshold.
+        ctx.send(&self.condition, CloseAboveModifier::SetThreshold(next));
+        Ok(())
     }
 }
 
@@ -106,15 +115,6 @@ impl Action<CloseAbove> for RaiseThreshold {
 struct Sma {
     period: usize,
     window: VecDeque<Decimal>,
-}
-
-impl Sma {
-    fn new(period: usize) -> Self {
-        Self {
-            period,
-            window: VecDeque::with_capacity(period),
-        }
-    }
 }
 
 impl Transformer for Sma {
@@ -126,21 +126,21 @@ impl Transformer for Sma {
         format!("sma({})", self.period)
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
-        match m {}
-    }
-
     fn warm_up(&self) -> usize {
         self.period
     }
 
-    fn on_data(&mut self, candle: &Candle) -> Option<Decimal> {
-        self.window.push_back(candle.close);
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Decimal> {
+        self.window.push_back(item.data.close);
         if self.window.len() > self.period {
             self.window.pop_front();
         }
         (self.window.len() == self.period)
             .then(|| self.window.iter().sum::<Decimal>() / Decimal::from(self.period))
+    }
+
+    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+        match m {}
     }
 }
 
@@ -160,75 +160,67 @@ impl Condition for SmaAbove {
     type Value = Level;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, item: &Derived<Candle, Decimal>) -> Option<Detection<Level>> {
-        let sma = item.value?; // None while the SMA warms up
+    fn warm_up(&self) -> usize {
+        0
+    }
+
+    fn on_data(&mut self, item: Item<'_, Derived<Candle, Decimal>>) -> Option<Detection<Level>> {
+        let sma = item.data.value?; // None while the SMA warms up
         (sma > self.level).then_some(Detection {
             event_type: TriggerEventType::Other("sma_above"),
-            value: Level(sma),
+            value: Level(sma.round_dp(2)),
         })
     }
 
-    fn on_modifier(&mut self, modifier: NoModifier) -> Result<(), ModifierError> {
-        match modifier {}
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
+        match m {}
     }
 }
 
-// ----------------------------------------------------------------------- Data
-fn candle(minute: i64, close: i64) -> Candle {
-    let close = Decimal::from(close);
-    let open_time: DateTime<Utc> = DateTime::UNIX_EPOCH + TimeDelta::minutes(minute);
-    Candle {
-        open_time,
-        open: close,
-        high: close,
-        low: close,
-        close,
-        volume: Decimal::ONE,
-    }
-}
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut g = Graph::new();
+    let btc = g.source(common::replay(
+        "BTCUSDT",
+        &[100, 102, 105, 103, 108, 110, 107, 112, 115, 111],
+    ));
 
-fn btc_source() -> MockSource<Candle> {
-    let closes = [100, 102, 105, 103, 108, 110, 107, 112, 115, 111];
-    let candles = closes
-        .iter()
-        .zip(0..)
-        .map(|(&c, minute)| candle(minute, c))
-        .collect();
-    MockSource::new("BTCUSDT", Timeframe::M1, candles).with_interval(Duration::from_millis(100))
-}
-
-#[tokio::main]
-async fn main() -> Result<(), SourceError> {
-    let mut bot = Bot::new();
-
-    // Rule 1: close above threshold; the action raises the threshold via a modifier.
-    let mut btc_a = btc_source();
-    bot.rule(Rule::new(
+    // Branch 1: close above threshold; the action raises the threshold.
+    let close_above = g.condition(
         "close-above",
-        btc_a.get_source_stream()?,
         CloseAbove {
             threshold: Decimal::from(101),
         },
+        &btc,
+    );
+    let handle = g.modifier_handle(&close_above);
+    g.action(
         RaiseThreshold {
             step: Decimal::from(3),
+            condition: handle,
         },
-    ));
-    bot.source(btc_a);
+        &close_above,
+    );
 
-    // Rule 2: candles -> SMA(3) -> SMA above a level, plain alert.
-    let mut btc_b = btc_source();
-    let mut btc_sma = Transformed::new(Sma::new(3), btc_b.get_source_stream()?);
-    bot.rule(Rule::new(
+    // Branch 2: candles -> SMA(3) -> SMA above a level -> alert.
+    let sma = g.transform(
+        Sma {
+            period: 3,
+            window: VecDeque::new(),
+        },
+        &btc,
+    );
+    let sma_above = g.condition(
         "sma-above",
-        btc_sma.get_source_stream()?,
         SmaAbove {
             level: Decimal::from(110),
         },
-        Alert,
-    ));
-    bot.source(btc_b);
-    bot.source(btc_sma);
+        &sma,
+    );
+    g.action(Alert::new(), &sma_above);
 
-    bot.run().await;
+    Executor::new(g).run()?;
     Ok(())
 }

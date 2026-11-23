@@ -1,34 +1,37 @@
 //! ilus — a market-monitoring bot.
 //!
-//! The bot is a pipeline of building blocks (see `SPECS.md`):
+//! Entities are the nodes of a [`graph::Graph`] run tick by tick by an
+//! [`executor::Executor`] (see `SPECS.md` §5):
 //!
 //! ```text
-//! Source --> [Transformer]* --> Condition --trigger event--> Action
-//!                                   ^                          |
-//!                                   +-------- modifier --------+
+//! Source ──> [Transformer]* ──> Condition ──> Action
+//!                 ^                 ^            │
+//!                 └─────────────────┴─ modifier ─┘
 //! ```
 //!
-//! - [`source`]: where data comes from ([`source::Source`], [`source::SourceStream`]).
-//!   Each source has one channel and exactly one consumer.
-//! - [`candle`]: the OHLCV data item delivered by provider sources.
-//! - [`transformer`]: turns one source into another ([`transformer::Transformer`],
-//!   [`transformer::Transformed`]).
-//! - [`condition`]: detects situations on a source stream ([`condition::Condition`]).
-//! - [`trigger`]: events emitted by conditions ([`trigger::TriggerEvent`]).
-//! - [`action`]: reacts to trigger events ([`action::Action`]).
-//! - [`modifier`]: information sent back to a condition ([`modifier::ModifierSender`]).
-//! - [`rule`]: binds a source, a condition and an action ([`rule::Rule`]).
-//! - [`bot`]: wires everything together and runs it ([`bot::Bot`]).
+//! - [`source`]: produce closed data items, each tagged with a running
+//!   [`source::Mode`] (bootstrap, replay, normal).
+//! - [`candle`]: the OHLCV data item of provider sources.
+//! - [`transformer`]: sync, turn one input into a new output (always
+//!   forwarding the input), e.g. RSI.
+//! - [`condition`]: sync, detect situations on one input.
+//! - [`trigger`]: detections and trigger events.
+//! - [`action`]: react to the detections of one condition (sync; network work
+//!   is started on the async runtime).
+//! - [`modifier`]: information sent back to a condition or a transformer.
+//! - [`graph`]: typed builder of the graph.
+//! - [`executor`]: runs the graph on the calling thread, with an async
+//!   runtime on its own threads for network work.
 //!
-//! Everything is statically typed and wired in code: no configuration file.
+//! Everything is wired in code: no configuration file.
 
 pub mod action;
-pub mod bot;
 pub mod candle;
 pub mod condition;
 pub mod error;
+pub mod executor;
+pub mod graph;
 pub mod modifier;
-pub mod rule;
 pub mod source;
 pub mod transformer;
 pub mod trigger;

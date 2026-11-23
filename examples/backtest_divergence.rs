@@ -2,10 +2,13 @@
 //! from `days` days ago (00:00 UTC, default 1 = yesterday) until now.
 //!
 //! ```text
-//! BinanceSource(SOLUSDT, timeframe, yesterday..now) ──> Rsi(14) ──> RsiDivergence ──> Simulator
+//! BinanceSource(SOLUSDT, tf, replay) ──> Rsi(14) ──> RsiDivergence ──┬─> Simulator (fee 1)
+//!                                                                     └─> Simulator (fee 2) ...
 //! ```
 //!
 //! Rules:
+//! - before the period, the source bootstraps the candles needed to warm up
+//!   the RSI and the divergence detection (no trade during the warm-up);
 //! - start with 10 SOL;
 //! - a fee (in %, default 0) is taken on each transaction, from what it produces;
 //! - bearish divergence (price maximum): sell all SOL;
@@ -16,24 +19,23 @@
 //! ends it prints its log and a summary (the SOL held at the last bearish
 //! divergence).
 //!
-//! Several fees can be given: one simulation runs per fee, on the same time
-//! window (each with its own source, since a source has one consumer).
+//! Several fees can be given: one simulator (action) per fee, all connected to
+//! the same condition. The replay runs as fast as possible.
 //!
 //! Run with: `cargo run --example backtest_divergence -- [--days N] [timeframe] [fees %...]`
 //! e.g. `cargo run --example backtest_divergence -- --days 7 15m 0 0.2`
 //! (timeframe: 1m 5m 15m 1h 4h 1d, default 1m; fees default 0).
 
 use chrono::{DateTime, Utc};
-use ilus::action::{Action, EventOf};
-use ilus::bot::Bot;
-use ilus::condition::divergence::{DivergenceKind, DivergenceParams, RsiDivergence};
+use ilus::action::{Action, ActionContext};
+use ilus::condition::divergence::{Divergence, DivergenceKind, DivergenceParams, RsiDivergence};
 use ilus::error::ActionError;
-use ilus::modifier::{ModifierSender, NoModifier};
-use ilus::rule::Rule;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
+use ilus::source::Timeframe;
 use ilus::source::binance::BinanceSource;
-use ilus::source::{Source, Timeframe};
-use ilus::transformer::Transformed;
-use ilus::transformer::rsi::Rsi;
+use ilus::transformer::rsi::{Rsi, RsiCandle};
+use ilus::trigger::TriggerEvent;
 use rust_decimal::Decimal;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -79,11 +81,14 @@ fn fmt_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M").to_string()
 }
 
-impl Action<RsiDivergence> for Simulator {
-    async fn run(
+impl Action for Simulator {
+    type Value = Divergence;
+    type Input = RsiCandle;
+
+    fn run(
         &mut self,
-        event: EventOf<RsiDivergence>,
-        _modifiers: &ModifierSender<NoModifier>,
+        event: TriggerEvent<'_, Divergence, RsiCandle>,
+        _ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
         let candle = &event.data.data; // candle that confirmed the divergence
         let price = candle.close;
@@ -182,21 +187,7 @@ impl Drop for Simulator {
 }
 
 /// Parse a timeframe argument (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`).
-fn timeframe(arg: &str) -> Option<Timeframe> {
-    [
-        Timeframe::M1,
-        Timeframe::M5,
-        Timeframe::M15,
-        Timeframe::H1,
-        Timeframe::H4,
-        Timeframe::D1,
-    ]
-    .into_iter()
-    .find(|tf| tf.to_string() == arg)
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arguments: optional `--days N`, optional timeframe, then fees in %.
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut days: i64 = 1;
@@ -215,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_hms_opt(0, 0, 0)
         .ok_or("cannot compute start date")?
         .and_utc();
-    let timeframe = match args.first().and_then(|a| timeframe(a)) {
+    let timeframe = match args.first().and_then(|a| Timeframe::parse(a)) {
         Some(tf) => {
             args.remove(0);
             tf
@@ -235,23 +226,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fmt_time(now)
     );
 
-    let mut bot = Bot::new();
+    // One source, one RSI, one condition; one simulator (action) per fee.
+    let mut g = Graph::new();
+    let sol = g.source(BinanceSource::new("SOLUSDT", timeframe).replay(from, now));
+    let sol_rsi = g.transform(Rsi::new(14)?, &sol);
+    let divergence = g.condition(
+        "sol-divergence",
+        RsiDivergence::new(DivergenceParams::for_timeframe(timeframe))?,
+        &sol_rsi,
+    );
     for fee in fees {
-        // Same time window for every simulation.
-        let mut sol = BinanceSource::new("SOLUSDT", timeframe)
-            .with_start(from)
-            .with_end(now);
-        let mut sol_rsi = Transformed::new(Rsi::new(14)?, sol.get_source_stream()?);
-        bot.rule(Rule::new(
-            format!("sol-divergence-fee-{fee}"),
-            sol_rsi.get_source_stream()?,
-            RsiDivergence::new(DivergenceParams::for_timeframe(timeframe))?,
-            Simulator::new(Decimal::from(10), fee),
-        ));
-        bot.source(sol);
-        bot.source(sol_rsi);
+        g.action(Simulator::new(Decimal::from(10), fee), &divergence);
     }
 
-    bot.run().await;
+    // Replay as fast as possible.
+    Executor::new(g)
+        .with_tick(std::time::Duration::ZERO)
+        .run()?;
     Ok(())
 }

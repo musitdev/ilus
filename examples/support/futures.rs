@@ -1,21 +1,22 @@
 //! Futures simulation shared by `backtest_futures` and `chart_futures`:
 //! the [`WithTicks`] condition, the [`Futures`] account (action) and the
 //! command-line [`Args`]. See `backtest_futures.rs` for the rules.
+#![allow(dead_code)] // each example uses a subset
 
 use std::fmt::Write;
-use std::marker::PhantomData;
 use std::str::FromStr;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use ilus::action::{Action, EventOf};
+use ilus::action::{Action, ActionContext};
+use ilus::candle::Candle;
 use ilus::condition::Condition;
 use ilus::condition::divergence::{Divergence, DivergenceKind, DivergenceParams, RsiDivergence};
 use ilus::error::{ActionError, ModifierError};
-use ilus::modifier::{ModifierSender, NoModifier};
-use ilus::source::{SourceData, Timeframe};
-use ilus::transformer::Derived;
+use ilus::modifier::NoModifier;
+use ilus::source::{Item, Timeframe};
 use ilus::transformer::rsi::RsiCandle;
-use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
+use ilus::trigger::{Detection, TriggerEvent, TriggerEventType, TriggerValue};
 use rust_decimal::Decimal;
 
 /// Maintenance margin rate (share of notional).
@@ -31,47 +32,21 @@ pub enum Signal {
 }
 impl TriggerValue for Signal {}
 
-/// Items carrying an RSI candle: the RSI output itself, or the output of a
-/// pass-through transformer placed after it (e.g. the chart).
-pub trait HasRsiCandle: SourceData {
-    fn rsi_candle(&self) -> &RsiCandle;
-}
-
-impl HasRsiCandle for RsiCandle {
-    fn rsi_candle(&self) -> &RsiCandle {
-        self
-    }
-}
-
-impl HasRsiCandle for Derived<RsiCandle, ()> {
-    fn rsi_candle(&self) -> &RsiCandle {
-        &self.data
-    }
-}
-
 /// Wraps [`RsiDivergence`] and also emits an event for every candle
 /// (the action needs every candle to check stops and liquidation).
-pub struct WithTicks<I = RsiCandle> {
-    inner: RsiDivergence,
-    input: PhantomData<fn(I)>,
-}
+pub struct WithTicks(pub RsiDivergence);
 
-impl<I> WithTicks<I> {
-    pub fn new(inner: RsiDivergence) -> Self {
-        Self {
-            inner,
-            input: PhantomData,
-        }
-    }
-}
-
-impl<I: HasRsiCandle> Condition for WithTicks<I> {
-    type Input = I;
+impl Condition for WithTicks {
+    type Input = RsiCandle;
     type Value = Signal;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, item: &I) -> Option<Detection<Signal>> {
-        Some(match self.inner.on_data(item.rsi_candle()) {
+    fn warm_up(&self) -> usize {
+        self.0.warm_up()
+    }
+
+    fn on_data(&mut self, item: Item<'_, RsiCandle>) -> Option<Detection<Signal>> {
+        Some(match self.0.on_data(item) {
             Some(d) => Detection {
                 event_type: d.event_type,
                 value: Signal::Divergence(d.value),
@@ -83,7 +58,10 @@ impl<I: HasRsiCandle> Condition for WithTicks<I> {
         })
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }
@@ -105,14 +83,24 @@ pub enum TradeKind {
     Liquidation,
 }
 
-/// Receives every trade of the simulation (e.g. to draw it on a chart).
+/// One trade of the simulation.
+#[derive(Debug, Clone)]
+pub struct Trade {
+    pub time: DateTime<Utc>,
+    pub price: Decimal,
+    pub kind: TradeKind,
+    pub label: String,
+}
+
+/// Receives every trade of the simulation (e.g. to draw it on a chart, with
+/// a modifier sent through `ctx`).
 pub trait TradeRecorder: Send + 'static {
-    fn record(&mut self, time: DateTime<Utc>, price: Decimal, kind: TradeKind, label: String);
+    fn record(&mut self, ctx: &mut ActionContext, trade: Trade);
 }
 
 /// No recorder.
 impl TradeRecorder for () {
-    fn record(&mut self, _: DateTime<Utc>, _: Decimal, _: TradeKind, _: String) {}
+    fn record(&mut self, _: &mut ActionContext, _: Trade) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +124,8 @@ impl Position {
 /// Simulated futures account.
 pub struct Futures<R: TradeRecorder = ()> {
     recorder: R,
+    /// Trades of the current event, given to the recorder after it.
+    pending: Vec<Trade>,
     /// Open time of the candle being processed.
     time: DateTime<Utc>,
     start_sol: Decimal,
@@ -173,6 +163,7 @@ impl<R: TradeRecorder> Futures<R> {
     ) -> Self {
         Self {
             recorder,
+            pending: Vec::new(),
             time: DateTime::<Utc>::UNIX_EPOCH,
             start_sol,
             leverage,
@@ -256,12 +247,12 @@ impl<R: TradeRecorder> Futures<R> {
                 p.entry.normalize(),
                 worst.normalize()
             );
-            self.recorder.record(
-                self.time,
-                worst,
-                TradeKind::Liquidation,
-                "liquidated".into(),
-            );
+            self.pending.push(Trade {
+                time: self.time,
+                price: worst,
+                kind: TradeKind::Liquidation,
+                label: "liquidated".into(),
+            });
         } else {
             self.min_equity = self.min_equity.min(equity);
         }
@@ -294,7 +285,12 @@ impl<R: TradeRecorder> Futures<R> {
             },
             self.pct(equity)
         );
-        self.recorder.record(self.time, price, kind, label);
+        self.pending.push(Trade {
+            time: self.time,
+            price,
+            kind,
+            label,
+        });
     }
 
     fn open(&mut self, when: &str, side: Side, price: Decimal) {
@@ -323,18 +319,18 @@ impl<R: TradeRecorder> Futures<R> {
             margin.round_dp(2)
         );
         let label = format!("{side:?} {}", price.normalize());
-        self.recorder
-            .record(self.time, price, TradeKind::Open(side), label);
+        self.pending.push(Trade {
+            time: self.time,
+            price,
+            kind: TradeKind::Open(side),
+            label,
+        });
     }
 }
 
-impl<I: HasRsiCandle, R: TradeRecorder> Action<WithTicks<I>> for Futures<R> {
-    async fn run(
-        &mut self,
-        event: EventOf<WithTicks<I>>,
-        _modifiers: &ModifierSender<NoModifier>,
-    ) -> Result<(), ActionError> {
-        let c = &event.data.rsi_candle().data;
+impl<R: TradeRecorder> Futures<R> {
+    /// Process one candle (and its divergence, if any).
+    fn step(&mut self, value: &Signal, c: &Candle) {
         self.time = c.open_time;
         let when = fmt_time(c.open_time);
         self.last_price = c.close;
@@ -354,11 +350,11 @@ impl<I: HasRsiCandle, R: TradeRecorder> Action<WithTicks<I>> for Futures<R> {
         self.check_stop(&when, c.open, c.low, c.high);
         self.check_liquidation(&when, c.low, c.high);
         if self.position.is_none() && self.equity == Some(Decimal::ZERO) {
-            return Ok(()); // no equity left
+            return; // no equity left
         }
 
-        let Signal::Divergence(d) = event.value else {
-            return Ok(());
+        let Signal::Divergence(d) = value else {
+            return;
         };
         let (target, opposite) = match d.kind {
             DivergenceKind::Bullish => (Side::Long, Side::Short),
@@ -370,7 +366,7 @@ impl<I: HasRsiCandle, R: TradeRecorder> Action<WithTicks<I>> for Futures<R> {
                 "{when}  skip {:?} divergence (already {target:?})",
                 d.kind
             );
-            return Ok(());
+            return;
         }
         if self.position.is_some_and(|p| p.side == opposite) {
             self.close(&when, c.close, TradeKind::Close);
@@ -386,6 +382,22 @@ impl<I: HasRsiCandle, R: TradeRecorder> Action<WithTicks<I>> for Futures<R> {
             );
         }
         self.open(&when, target, c.close);
+    }
+}
+
+impl<R: TradeRecorder> Action for Futures<R> {
+    type Value = Signal;
+    type Input = RsiCandle;
+
+    fn run(
+        &mut self,
+        event: TriggerEvent<'_, Signal, RsiCandle>,
+        ctx: &mut ActionContext,
+    ) -> Result<(), ActionError> {
+        self.step(event.value, &event.data.data);
+        for trade in std::mem::take(&mut self.pending) {
+            self.recorder.record(ctx, trade);
+        }
         Ok(())
     }
 }
@@ -442,31 +454,21 @@ pub struct Args {
     pub stop: Option<Decimal>,
     pub params: DivergenceParams,
     pub fees: Vec<Decimal>,
+    /// Global tick of the replay (`--tick-ms`, default 0: as fast as possible).
+    pub tick: Duration,
     /// Description of the run.
     pub header: String,
 }
 
-pub fn timeframe(arg: &str) -> Option<Timeframe> {
-    [
-        Timeframe::M1,
-        Timeframe::M5,
-        Timeframe::M15,
-        Timeframe::H1,
-        Timeframe::H4,
-        Timeframe::D1,
-    ]
-    .into_iter()
-    .find(|tf| tf.to_string() == arg)
-}
-
 /// Parse `[--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N]
-/// [--right N] [--min-gap N] [--max-gap N] [timeframe] [fees %...]`.
+/// [--right N] [--min-gap N] [--max-gap N] [--tick-ms N] [timeframe] [fees %...]`.
 pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut days: u64 = 1;
     let mut from_date: Option<chrono::NaiveDate> = None;
     let mut to_date: Option<chrono::NaiveDate> = None;
     let mut leverage = Decimal::from(10);
+    let mut tick = Duration::ZERO;
     let mut stop: Option<Decimal> = None;
     // Pivot options; the gaps are given in candles and converted below.
     let (mut left, mut right) = (None::<usize>, None::<usize>);
@@ -475,6 +477,13 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         let value = args.get(1).ok_or(format!("{flag} needs a value"))?.clone();
         match flag.as_str() {
             "--days" => days = value.parse().map_err(|e| format!("invalid --days: {e}"))?,
+            "--tick-ms" => {
+                tick = Duration::from_millis(
+                    value
+                        .parse()
+                        .map_err(|e| format!("invalid --tick-ms: {e}"))?,
+                )
+            }
             "--leverage" => {
                 leverage =
                     Decimal::from_str(&value).map_err(|e| format!("invalid --leverage: {e}"))?
@@ -523,7 +532,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     if days < 1 || leverage < Decimal::ONE {
         return Err("--days and --leverage must be >= 1".into());
     }
-    let timeframe = match args.first().and_then(|a| timeframe(a)) {
+    let timeframe = match args.first().and_then(|a| Timeframe::parse(a)) {
         Some(tf) => {
             args.remove(0);
             tf
@@ -579,6 +588,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         stop,
         params,
         fees,
+        tick,
         header,
     })
 }

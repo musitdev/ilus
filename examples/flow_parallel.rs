@@ -1,28 +1,29 @@
-//! Independent rules running in parallel.
+//! Several sources in one graph: at each global tick (bootstrap and replay),
+//! every source is called one after the other and delivers one item.
 //!
 //! ```text
-//! MockSource "FAST" (every 50 ms, 8 candles)  ──> Above(fast) ──> LogAction
-//! MockSource "SLOW" (every 200 ms, 3 candles) ──> Above(slow) ──> LogAction
+//! MockSource "FAST" (8 candles) ──> Above(5)   ──> LogAction
+//! MockSource "SLOW" (3 candles) ──> Above(150) ──> LogAction
 //! ```
 //!
 //! What to check in the output:
-//! - both streams interleave: neither rule waits for the other;
-//! - each rule only sees its own source;
-//! - the slow source ends first in candles but later in time; the bot stops
-//!   only when every source has ended and every action has finished.
+//! - the two sources alternate, one candle each per tick (FAST, SLOW, FAST, ...);
+//! - once SLOW has ended, FAST continues alone;
+//! - each condition only sees its own source;
+//! - the executor stops when every source has ended.
 //!
 //! Run with: `cargo run --example flow_parallel`
 
 mod common;
 
-use common::{LogAction, idx, log, mock};
-use ilus::bot::Bot;
+use common::{LogAction, idx, log};
 use ilus::candle::Candle;
 use ilus::condition::Condition;
 use ilus::error::ModifierError;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
 use ilus::modifier::NoModifier;
-use ilus::rule::Rule;
-use ilus::source::Source;
+use ilus::source::Item;
 use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
 use rust_decimal::Decimal;
 
@@ -42,48 +43,50 @@ impl Condition for Above {
     type Value = Close;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, c: &Candle) -> Option<Detection<Close>> {
+    fn warm_up(&self) -> usize {
+        0
+    }
+    fn on_data(&mut self, item: Item<'_, Candle>) -> Option<Detection<Close>> {
+        let c = item.data;
         log(self.name, format!("candle #{} close={}", idx(c), c.close));
         (c.close > self.level).then_some(Detection {
             event_type: TriggerEventType::Other("above"),
             value: Close(c.close),
         })
     }
-
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut bot = Bot::new();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut g = Graph::new();
+    let fast = g.source(common::replay("FAST", &[1, 2, 3, 4, 5, 6, 7, 8]));
+    let slow = g.source(common::replay("SLOW", &[100, 200, 300]));
 
-    let mut fast = mock("FAST", &[1, 2, 3, 4, 5, 6, 7, 8], 50);
-    let mut slow = mock("SLOW", &[100, 200, 300], 200);
-
-    bot.rule(Rule::new(
+    let fast_above = g.condition(
         "fast-above-5",
-        fast.get_source_stream()?,
         Above {
             name: "cond FAST",
             level: Decimal::from(5),
         },
-        LogAction,
-    ));
-    bot.rule(Rule::new(
+        &fast,
+    );
+    let slow_above = g.condition(
         "slow-above-150",
-        slow.get_source_stream()?,
         Above {
             name: "cond SLOW",
             level: Decimal::from(150),
         },
-        LogAction,
-    ));
-    bot.source(fast);
-    bot.source(slow);
+        &slow,
+    );
+    g.action(LogAction::new("action"), &fast_above);
+    g.action(LogAction::new("action"), &slow_above);
 
-    bot.run().await;
-    log("main", "bot.run() returned: all sources ended");
+    Executor::new(g).run()?;
+    log("main", "executor stopped: all sources ended");
     Ok(())
 }

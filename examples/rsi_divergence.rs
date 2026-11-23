@@ -7,21 +7,23 @@
 //! - Bullish divergence (bear phase): price lower low, RSI higher low.
 //! - Bearish divergence (bull phase): price higher high, RSI lower high.
 //!
-//! Loads the last 500 candles (past divergences are printed immediately),
-//! then follows the live feed.
+//! Bootstraps the last 500 candles (warm-up only: bootstrap produces no event),
+//! then prints each divergence detected on the live feed. To see past
+//! divergences, use the backtest examples (replay mode).
 //!
 //! Run with: `cargo run --example rsi_divergence` (Ctrl+C to stop).
 
-use ilus::action::{Action, EventOf};
-use ilus::bot::Bot;
-use ilus::condition::divergence::{DivergenceKind, DivergenceParams, Pivot, RsiDivergence};
+use ilus::action::{Action, ActionContext};
+use ilus::condition::divergence::{
+    Divergence, DivergenceKind, DivergenceParams, Pivot, RsiDivergence,
+};
 use ilus::error::ActionError;
-use ilus::modifier::{ModifierSender, NoModifier};
-use ilus::rule::Rule;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
+use ilus::source::Timeframe;
 use ilus::source::binance::BinanceSource;
-use ilus::source::{Source, Timeframe};
-use ilus::transformer::Transformed;
-use ilus::transformer::rsi::Rsi;
+use ilus::transformer::rsi::{Rsi, RsiCandle};
+use ilus::trigger::TriggerEvent;
 
 /// Prints a divergence in a readable form.
 struct PrintDivergence;
@@ -35,13 +37,16 @@ fn pivot(p: &Pivot) -> String {
     )
 }
 
-impl Action<RsiDivergence> for PrintDivergence {
-    async fn run(
+impl Action for PrintDivergence {
+    type Value = Divergence;
+    type Input = RsiCandle;
+
+    fn run(
         &mut self,
-        event: EventOf<RsiDivergence>,
-        _modifiers: &ModifierSender<NoModifier>,
+        event: TriggerEvent<'_, Divergence, RsiCandle>,
+        _ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
-        let d = &event.value;
+        let d = event.value;
         let (title, price, rsi) = match d.kind {
             DivergenceKind::Bullish => {
                 ("BULLISH divergence (bear phase)", "lower low", "higher low")
@@ -61,22 +66,18 @@ impl Action<RsiDivergence> for PrintDivergence {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut bot = Bot::new();
-
-    let mut sol = BinanceSource::new("SOLUSDT", Timeframe::M1).with_history(500);
-    let mut sol_rsi = Transformed::new(Rsi::new(14)?, sol.get_source_stream()?);
-
-    bot.rule(Rule::new(
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut g = Graph::new();
+    // Bootstrap: 500 candles to warm up RSI and pivots (no output), then live.
+    let sol = g.source(BinanceSource::new("SOLUSDT", Timeframe::M1).with_bootstrap(500));
+    let sol_rsi = g.transform(Rsi::new(14)?, &sol);
+    let divergence = g.condition(
         "sol-rsi-divergence",
-        sol_rsi.get_source_stream()?,
-        RsiDivergence::new(DivergenceParams::default())?,
-        PrintDivergence,
-    ));
-    bot.source(sol);
-    bot.source(sol_rsi);
+        RsiDivergence::new(DivergenceParams::for_timeframe(Timeframe::M1))?,
+        &sol_rsi,
+    );
+    g.action(PrintDivergence, &divergence);
 
-    bot.run().await;
+    Executor::new(g).run()?;
     Ok(())
 }

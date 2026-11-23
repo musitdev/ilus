@@ -4,20 +4,20 @@
 //! BinanceSource(SOLUSDT, 1m) ──> Rsi(14) ──> RsiExtreme(30, 70) ──> Alert
 //! ```
 //!
-//! Loads the last 50 closed candles, then follows the live feed.
-//! Every candle is printed with its RSI; an alert fires when RSI < 30 or > 70.
+//! Bootstraps the last 50 closed candles (printed, no alert), then follows the
+//! live feed: one REST request just after each candle close. Every candle is
+//! printed with its RSI; an alert fires when RSI < 30 or > 70 (live only).
 //!
 //! Run with: `cargo run --example binance_sol_rsi` (Ctrl+C to stop).
 
 use ilus::action::Alert;
-use ilus::bot::Bot;
 use ilus::condition::Condition;
 use ilus::error::ModifierError;
+use ilus::executor::Executor;
+use ilus::graph::Graph;
 use ilus::modifier::NoModifier;
-use ilus::rule::Rule;
 use ilus::source::binance::BinanceSource;
-use ilus::source::{Source, Timeframe};
-use ilus::transformer::Transformed;
+use ilus::source::{Item, Timeframe};
 use ilus::transformer::rsi::{Rsi, RsiCandle};
 use ilus::trigger::{Detection, TriggerEventType, TriggerValue};
 use rust_decimal::Decimal;
@@ -41,11 +41,17 @@ impl Condition for RsiExtreme {
     type Value = RsiSignal;
     type Modifier = NoModifier;
 
-    fn on_data(&mut self, item: &RsiCandle) -> Option<Detection<RsiSignal>> {
+    fn warm_up(&self) -> usize {
+        0
+    }
+
+    fn on_data(&mut self, item: Item<'_, RsiCandle>) -> Option<Detection<RsiSignal>> {
+        let mode = item.mode;
+        let item = item.data;
         let c = &item.data;
         let rsi = item.value.map(|v| v.round_dp(2));
         println!(
-            "[SOL] {} close={} volume={} rsi={}",
+            "[SOL] {} close={} volume={} rsi={} ({mode:?})",
             c.open_time,
             c.close,
             c.volume,
@@ -65,30 +71,29 @@ impl Condition for RsiExtreme {
         })
     }
 
-    fn on_modifier(&mut self, modifier: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        modifier: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match modifier {}
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut bot = Bot::new();
-
-    let mut sol = BinanceSource::new("SOLUSDT", Timeframe::M1).with_history(50);
-    let mut sol_rsi = Transformed::new(Rsi::new(14)?, sol.get_source_stream()?);
-
-    bot.rule(Rule::new(
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut g = Graph::new();
+    // Bootstrap: at least 50 candles (more than the RSI warm-up), then live.
+    let sol = g.source(BinanceSource::new("SOLUSDT", Timeframe::M1).with_bootstrap(50));
+    let sol_rsi = g.transform(Rsi::new(14)?, &sol);
+    let extreme = g.condition(
         "sol-rsi-extreme",
-        sol_rsi.get_source_stream()?,
         RsiExtreme {
             low: Decimal::from(30),
             high: Decimal::from(70),
         },
-        Alert,
-    ));
-    bot.source(sol);
-    bot.source(sol_rsi);
+        &sol_rsi,
+    );
+    g.action(Alert::new(), &extreme);
 
-    bot.run().await;
+    Executor::new(g).run()?;
     Ok(())
 }
