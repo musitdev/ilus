@@ -15,7 +15,7 @@ ilus is **not a trading-strategy engine**. It does not model strategies in terms
 - Detect conditions on asset prices or related data, typically patterns on the candlestick chart (e.g. hammer, engulfing, doji). A set of predefined conditions is provided.
 - When a condition triggers, execute its associated action. A set of predefined actions is provided.
 - Run as a long-lived bot: once started, it evaluates all defined conditions continuously and indefinitely.
-- **No event is lost**: every detection is queued and processed by the action, in order. If an action is too slow, the executor waits before the next tick instead of dropping events.
+- **No event is lost**: every detection reaches its actions within the tick; a slow action makes the tick longer, it never drops events.
 - **Scale to hundreds of entities**: entities are nodes of a graph run by a single executor, tick by tick (§5).
 - Let actions change how a condition operates by sending it **modifiers** (e.g. switch the threshold set, watch only bearish patterns).
 - Conditions are evaluated independently: while an action runs, other conditions keep being evaluated.
@@ -66,7 +66,7 @@ flowchart LR
 
 ```rust
 let mut g = Graph::new();
-let sol     = g.source(BinanceSource::new("SOLUSDT", M15).bootstrap(100)); // Output<Candle>
+let sol     = g.source(BinanceSource::new("SOLUSDT", M15));                // Output<Candle>
 let sol_rsi = g.transform(Rsi::new(14)?, &sol);                            // Output<RsiCandle>
 let div     = g.condition(RsiDivergence::default(), &sol_rsi);             // Output<Detection<Divergence>>
 let chart   = g.transform(chart, &sol_rsi);                                // fan-out: same output used twice
@@ -78,21 +78,22 @@ Executor::new(g).run().await;
 
 - **Typed builder**: every builder call returns a typed handle (`Output<T>`); connecting an entity to an output of the wrong type is a **compile error**. Internally the executor stores nodes as trait objects (`dyn`), the only way to hold hundreds of entities of different types.
 - **Fan-out**: an output can feed any number of transformers and conditions; consumers read the item **by reference** (no copy).
-- A transformer or a condition has **one input** (several inputs: later, see Open questions). A condition can feed **several actions**.
+- A transformer or a condition has **exactly one input**. To combine or split data, special **merge / split sources** produce a new source from existing ones (e.g. merge SOL 15m and SOL 1h, then connect an RSI condition to the merged source).
+- A condition can feed **several actions**. An action has **one input value type**, defined by the action; it can be connected to several conditions producing that type.
 - The graph is acyclic by construction (an entity can only be connected to existing outputs). Modifiers are not edges: they go back from actions to a condition or a transformer through a typed handle.
 - There is no `Rule` and no channel between entities anymore.
 
 ### 5.2 Execution: sync entities, async actions
 - **Transformers and conditions are sync** (no network): plain functions called by the executor.
 - **Sources**: the executor calls each source synchronously at its ticks; the call never blocks. Network work (REST requests) runs in the background inside the source; a tick returns the next item if one is ready.
-- **Actions can be async**: each action instance runs in **its own task**. The executor sends it each event without waiting; the task processes its events one at a time, in order. What an action produces (modifiers, later events such as an order result) goes back to the executor.
+- **Actions can be async**: the executor **awaits** each action within the tick (§5.5). An action that needs the network (order, webhook) starts its own task for that work and returns at once, so the tick is not blocked. Results of such background work (e.g. "order filled") come back to the executor and are applied at the next tick boundary.
 
 ### 5.3 Running modes
 The running mode is set by the **source** and carried **in each data item**; transformers keep the mode of their input; the executor reads it from the data.
 
 | Mode | Data | Events sent to actions | Ticks |
 |---|---|---|---|
-| **Bootstrap** | history before the start, to warm up conditions (e.g. 100 candles) | **no** (conditions only update their state) | global tick, every 10 ms |
+| **Bootstrap** | history before the start, to warm up transformers and conditions (length computed from the graph, §5.4) | **no** (conditions only update their state) | global tick, every 10 ms |
 | **Replay** | history over a chosen period (backtests) | yes | global tick, every 10 ms |
 | **Normal** | live data | yes | per source, aligned on candle close |
 
@@ -102,20 +103,22 @@ A source always starts with **bootstrap**, then goes to **normal** (live) or **r
 - **Bootstrap and replay**: one **global tick every 10 ms** (configurable; can be lowered if too slow). At each tick, every source in bootstrap or replay is called **one after the other**, in graph order, and delivers **one item**. The source periods are not respected (sources with different timeframes are not time-aligned).
 - **Normal**: each source is called **just after each expected candle close** (close + 2 s by default). If the candle is not available yet, it is called again every **half period** (30 s for 1m) until it is.
 - A tick of a source that returns no item does nothing downstream.
+- **Bootstrap length**: each transformer and condition declares how many items it needs (`warm_up()`). When the graph is built, each source gets a bootstrap length equal to the **maximum, over every path downstream of it, of the sum of the warm-ups along the path** (e.g. RSI(14) needs 15, divergence needs `left + 1 + right` = 7: the source bootstraps 22 candles). A source may ask for more.
 
 ### 5.5 Tick processing
-For each tick:
-1. **Apply the modifiers** received since the previous tick, in arrival order.
-2. **Call the due sources**; each returns zero or one item.
-3. For each new item, **evaluate the downstream nodes** in graph order (transformers, then conditions). Each node runs at most once per item.
-4. **Propagate the events**: detections of items in replay or normal mode are sent to the connected actions (without waiting); detections of bootstrap items are dropped.
+A tick is **fully sequential**:
+1. **Sources**: call every due source; each returns zero or one item.
+2. **Transformers and conditions**: for each new item, evaluate the downstream nodes in graph order. Each node runs at most once per item.
+3. **Actions**: for every detection (except from bootstrap items), run the connected actions, in graph order; the executor **waits for each action**.
+4. **Modifiers**: apply every modifier produced during the tick (and results of background action work received meanwhile), in the order they were sent.
 5. Next tick.
 
-Modifiers sent by an action are therefore applied at the **first tick after they arrive**. In live mode the action has normally finished before the next tick; in bootstrap and replay (10 ms ticks) a modifier may be applied a few ticks later. This is accepted: no order or external call is made during bootstrap, and replay actions only simulate.
+Consequences:
+- A modifier is always applied **before the next tick**, in every mode: execution is deterministic, also in bootstrap and replay.
+- Nothing piles up between entities: there is no event queue and no backpressure mechanism. A slow action simply makes the tick longer; the next tick waits.
 
-### 5.6 No event lost
-- Each action has a queue of pending events (max `max_pending`, default 64). If a queue is full, the executor **waits before the next tick** until it has room again, which slows the sources down. No event is dropped.
-- The executor stops when every source has ended (replay) and every action has processed its queue. A live source never ends.
+### 5.6 End of execution
+- The executor stops when every source has ended (replay). A live source never ends.
 
 ### 5.7 Acceptance criteria
 - [ ] Wrong connections (types) are compile errors.
@@ -124,10 +127,12 @@ Modifiers sent by an action are therefore applied at the **first tick after they
 - [ ] Bootstrap items reach conditions but produce no action event; replay and normal items do.
 - [ ] Bootstrap and replay: one item per source per global tick, sources called in graph order.
 - [ ] Normal: a source is called at candle close + delay, then every half period until the candle is available.
-- [ ] A modifier is applied at the first tick after it arrives, before the nodes of that tick.
-- [ ] An action processes its events in order; a full action queue delays the next tick; no event is lost.
-- [ ] The executor stops when all sources have ended and all actions are idle.
-- [ ] Replay backtests give deterministic results for actions that do not send modifiers.
+- [ ] Within a tick: sources, then transformers and conditions, then actions, then modifiers.
+- [ ] A modifier produced during a tick is applied before the next tick, in every mode.
+- [ ] Every detection (except bootstrap) reaches its actions; none is lost.
+- [ ] Bootstrap length per source = max over downstream paths of the sum of warm-ups.
+- [ ] The executor stops when all sources have ended.
+- [ ] Replay backtests are deterministic (same input → same events, same modifiers, same results).
 
 ## 6. Domain model
 ```rust
@@ -167,6 +172,8 @@ trait Transformer: Send + 'static {
     type Input: SourceData;
     type Value: Debug + Send + Sync + 'static;
     type Modifier: ModifierValue;
+    /// Items needed before the first value (used for the bootstrap length).
+    fn warm_up(&self) -> usize;
     fn on_data(&mut self, item: Item<'_, Self::Input>) -> Option<Self::Value>;
     fn on_modifier(&mut self, m: Self::Modifier) -> Result<(), ModifierError>;
 }
@@ -178,29 +185,38 @@ trait Condition: Send + 'static {
     type Input: SourceData;
     type Value: TriggerValue;
     type Modifier: ModifierValue;
+    /// Items needed before the first possible detection (bootstrap length).
+    fn warm_up(&self) -> usize;
     fn on_data(&mut self, item: Item<'_, Self::Input>) -> Option<Detection<Self::Value>>;
     fn on_modifier(&mut self, m: Self::Modifier) -> Result<(), ModifierError>;
 }
 struct Detection<V> { event_type: TriggerEventType, value: V }
 
-/// Event sent to an action (never for bootstrap items).
-struct TriggerEvent<V, D> {
-    condition: String,            // name of the condition node
+/// Event given to an action (never for bootstrap items). The action is awaited
+/// within the tick, so the event borrows the detection and the item (no copy).
+struct TriggerEvent<'a, V> {
+    condition: &'a str,           // name of the condition node
     event_type: TriggerEventType,
-    value: V,
-    source: SourceInfo,
-    time: DateTime<Utc>,
-    data: D,                      // triggering item (a copy: the action runs in its own task)
+    value: &'a V,
+    source: &'a SourceInfo,
+    time: DateTime<Utc>,          // time of the triggering item
+    mode: Mode,                   // replay or normal
 }
 
-/// Async, runs in its own task; processes its events one at a time, in order.
-trait Action<V, D>: Send + 'static {
-    async fn run(&mut self, event: TriggerEvent<V, D>) -> Result<(), ActionError>;
+/// One input value type, defined by the action. Awaited within the tick;
+/// network work is started in its own task (copying what it needs).
+trait Action: Send + 'static {
+    type Value: TriggerValue;
+    async fn run(&mut self, event: TriggerEvent<'_, Self::Value>, ctx: &mut ActionContext)
+        -> Result<(), ActionError>;
 }
+
+/// Lets an action send modifiers; they are applied at the end of the tick.
+struct ActionContext { /* modifiers produced during the tick */ }
 
 /// Typed handle to send modifiers to a condition or a transformer
-/// (obtained from the graph builder, given to actions).
-struct ModifierHandle<M> { /* node id + queue to the executor */ }
+/// (obtained from the graph builder, given to actions; used with ActionContext).
+struct ModifierHandle<M> { /* node id */ }
 
 /// Typed builder: handles carry the output type (and the modifier type of the
 /// node), so wrong links do not compile.
@@ -212,14 +228,13 @@ impl Graph {
         -> Output<Derived<T::Input, T::Value>, T::Modifier>;
     fn condition<C: Condition, M>(&mut self, c: C, input: &Output<C::Input, M>)
         -> Output<Detection<C::Value>, C::Modifier>;
-    fn action<A: Action<V, D>, V, D, M>(&mut self, a: A, input: &Output<Detection<V>, M>);
+    fn action<A: Action, M>(&mut self, a: A, input: &Output<Detection<A::Value>, M>);
     /// Typed handle to send modifiers to the node producing `output`.
     fn modifier_handle<T, M: ModifierValue>(&self, output: &Output<T, M>) -> ModifierHandle<M>;
 }
 
-/// Runs the graph tick by tick (§5.5) until every source has ended and every
-/// action is idle.
-struct Executor { /* graph, schedules, action queues, modifier queue */ }
+/// Runs the graph tick by tick (§5.5) until every source has ended.
+struct Executor { /* graph, source schedules, modifiers of the current tick */ }
 ```
 
 ## 7. Features
@@ -302,16 +317,16 @@ struct Executor { /* graph, schedules, action queues, modifier queue */ }
   | `timeframe` | candle precision | `1m` |
 
   ```rust
-  let btc_1m = g.source(BinanceSource::new("BTCUSDT", Timeframe::M1).bootstrap(100));
+  let btc_1m = g.source(BinanceSource::new("BTCUSDT", Timeframe::M1));
   ```
 - A provider source delivers **closed candles** (OHLCV) in chronological order, one per tick at most (§5.4), each tagged with its running mode (§5.3).
 - A **transformed source** is defined by an input source, a transformer and its parameters (see F4). It inherits the asset and timeframe of its input.
 - A source is added once to the graph; its output can feed any number of consumers (fan-out, §5.1), with a single connection to the provider.
 - Provider sources deliver **candles only** (price and volume). Other provider data (order book, trades, external indicators) is out of scope for now. Derived data (e.g. RSI) is produced by transformers.
 - The timeframe is requested directly from the provider (ilus does not aggregate candles). It is fixed at startup and does not change while running.
-- Modes (§5.3): `bootstrap(n)` warms up with the last `n` closed candles before the start (no action events); then either live data (**normal**), or `replay(from, to)`: every candle of the period, with action events, after which the source ends.
+- Modes (§5.3): **bootstrap** warms up with the last closed candles before the start (length computed from the graph, §5.4; no action events); then either live data (**normal**), or `replay(from, to)`: every candle of the period, with action events, after which the source ends.
 - A source signals whether a candle is closed; only closed candles are passed to conditions (see F0).
-- The bootstrap length is chosen in code (enough for the look-back of the transformers and conditions).
+- **Merge / split sources** (to be defined): build a new source from existing ones, e.g. merge two timeframes of the same asset for a condition that needs both.
 
 **Default source:**
 - A free, public crypto feed that requires no account or API key.
@@ -333,7 +348,7 @@ struct Executor { /* graph, schedules, action queues, modifier queue */ }
 **Acceptance criteria:**
 - [ ] Given a running default source for `BTC/USDT` 1m in normal mode, When a minute ends, Then exactly one closed candle is delivered, shortly after the close.
 - [ ] Given several consumers of one source, Then only one connection to the provider is used.
-- [ ] Given `bootstrap(n)`, Then `n` closed candles tagged *bootstrap* are delivered before the replay or live candles.
+- [ ] Given a bootstrap length `n` (computed from the graph), Then `n` closed candles tagged *bootstrap* are delivered before the replay or live candles.
 - [ ] Given `replay(from, to)`, Then every candle of the period is delivered, tagged *replay*, then the source ends.
 - [ ] A source can be replaced by a test/mock source delivering candles from memory, without changing condition code.
 
@@ -371,10 +386,10 @@ struct Executor { /* graph, schedules, action queues, modifier queue */ }
 
 **Behavior:**
 - An action receives a trigger event and executes.
-- An action is connected to one or more conditions in the graph; it can be **async** and runs in **its own task** (§5.2).
-- Events are processed one at a time, in detection order. When an action finishes an event (success or failure), the next queued event is processed.
+- An action has one input value type and is connected to one or more conditions producing it. It can be **async**; the executor awaits it within the tick (§5.5). Network work is started in its own task so the tick is not blocked.
+- Events are processed one at a time, in detection order, within the tick.
 - While running, an action may send **modifiers** to a condition or a transformer (F5), through handles given when the graph is built.
-- A slow action does not block the tick; if its queue is full, the executor waits before the next tick (§5.6).
+- Actions of a tick run after all conditions of that tick, in graph order.
 - There is no dry-run mode; testing is done with the **alert** action.
 
 **First action — Alert:**
@@ -382,7 +397,7 @@ struct Executor { /* graph, schedules, action queues, modifier queue */ }
 
 **Acceptance criteria:**
 - [ ] Given a trigger event, When the alert action runs, Then the event is printed with all its fields.
-- [ ] Given a failing action, Then the error is logged and the next event is processed.
+- [ ] Given a failing action, Then the error is logged and the tick continues with the next action.
 
 ### F4 — Transformers
 **Why:** Many conditions work on derived data (indicators such as RSI) rather than raw prices. A transformer computes that data once and exposes it as a new source, so conditions stay simple and the computation is shared.
@@ -394,13 +409,13 @@ struct Executor { /* graph, schedules, action queues, modifier queue */ }
 - During **warm-up** (not enough input yet, e.g. the first 14 changes for RSI 14), the value is `None`; the input item is still forwarded.
 - The transformed source inherits the asset and timeframe of its input.
 - Its output can feed any number of consumers (fan-out); it is computed once per item. Its items keep the running mode of the input (§5.3).
-- The source bootstrap must be long enough for the transformer warm-up **plus** the look-back of the conditions consuming its output.
+- It declares its warm-up (`warm_up()`), used to compute the source bootstrap length (§5.4).
 - A transformer only sees data items and modifiers; it knows nothing about conditions or actions.
-- A transformer may accept **modifiers** (F5), applied at the start of a tick (§5.5). Its modifier handle is obtained from the graph builder and given to actions. Modifiers arriving after its source has ended are still applied before the executor stops.
+- A transformer may accept **modifiers** (F5), applied at the end of the tick in which they are produced (§5.5). Its modifier handle is obtained from the graph builder and given to actions.
 
 **Example** (RSI 14 on BTCUSDT 1m closes):
 ```rust
-let btc_1m = g.source(BinanceSource::new("BTCUSDT", Timeframe::M1).bootstrap(100));
+let btc_1m = g.source(BinanceSource::new("BTCUSDT", Timeframe::M1));
 let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 ```
 
@@ -433,7 +448,7 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 - Each condition or transformer type defines the modifiers it accepts; a mismatch is a compile error.
 - Each condition type defines the modifiers it accepts (its own modifier type); their meaning is specific to the condition.
 - Modifiers are delivered **in the order they were sent**.
-- A modifier is applied at the **first tick after it arrives**, before the nodes of that tick run (§5.5); it never interrupts a node. It affects the next data items only; events already sent to actions are not changed.
+- Modifiers produced during a tick are applied at the **end of that tick**, after the actions, in send order (§5.5); they never interrupt a node. They affect the next ticks only.
 - Modifier effects live in memory only: on restart, conditions start again from their definition in code.
 
 **Example** (pattern condition): an action receives a *Bullish Engulfing* event, sends `WatchOnly(Bearish)`, then finishes. From the next candle, the condition only triggers on bearish patterns.
@@ -441,7 +456,7 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 **Acceptance criteria:**
 - [ ] Given an action that sends a modifier, Then the modifier applies to the next data items.
 - [ ] Given two modifiers sent in sequence, Then they are applied in the same order.
-- [ ] Given a modifier that arrives during a tick, Then it is applied at the start of the next tick.
+- [ ] Given a modifier produced by an action during a tick, Then it is applied before the next tick.
 - [ ] Given an invalid modifier (e.g. unknown threshold set), Then it is rejected, the error is logged and the condition is unchanged.
 
 **Edge cases & errors:**
@@ -524,14 +539,14 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 ## 11. Decisions
 - Default source provider: Binance public API. Alternatives if geo-restricted later: Bybit, OKX, Kraken, Coinbase.
 - Provider sources deliver candles only (price and volume). Derived data comes from transformers.
-- **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs ticks; transformers and conditions are sync; actions are async, one task each. No `Rule`, no channels between entities.
+- **Graph executor** (§5): entities are nodes of a graph built in code with a typed builder; one executor runs fully sequential ticks (sources → transformers and conditions → actions → modifiers). Transformers and conditions are sync; actions can be async and are awaited (network work in their own task). No `Rule`, no channels between entities, no event queue.
 - Running modes carried in the data, set by the source: bootstrap (warm-up, no action events), replay (history with action events), normal (live).
 - Ticks: bootstrap and replay share a global 10 ms tick (one item per source, sources called in graph order); normal mode is aligned on candle close (+2 s), then every half period.
-- One input per transformer and per condition (several inputs: later). Fan-out allowed: one output feeds many consumers, read by reference.
-- Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the first tick after they arrive; in memory only. No synchronisation between action results and conditions during bootstrap or replay.
+- One input per transformer and per condition; merge / split sources combine data. Fan-out allowed: one output feeds many consumers, read by reference. An action has one input value type.
+- Bootstrap length computed from the graph: max over downstream paths of the sum of the warm-ups.
+- Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the end of the tick, after the actions; in memory only.
 - Binance data over REST only (bootstrap/replay by pages, live polling); no WebSocket.
 - Timeframes are requested from the provider, fixed at startup.
-- No event is lost: each action has a queue (max `max_pending`, default 64); when a queue is full, the executor waits before the next tick.
 - A condition emits one event at a time, possibly of different event types.
 - No configuration file: the graph is defined in Rust code. The builder is statically typed; the executor stores nodes as trait objects internally.
 - No dry-run mode; the alert action and replay are used for testing.
@@ -545,9 +560,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 - ~~Value of N~~ → resolved: 5 retries with exponential backoff (1 s → 60 s).
 - If several patterns match the same candle in one condition, which event is emitted: the first by table order, one event listing all matches, or one condition instance per pattern?
 - Modifier senders: "mostly by actions". Who else can send them: other conditions, an external command (CLI), a timer?
-- Conditions with several inputs (e.g. RSI on 15m and 1h, or two assets): how are inputs of different sources aligned in time, given that bootstrap and replay sources are not time-aligned (§5.4)?
-- Can an action listen to conditions of different value types?
-- Live mode: if an action queue stays full, should the executor keep waiting (current decision, §5.6) or alert?
-- Should the bootstrap length be computed from the warm-up needs of the graph instead of being set by hand?
+- Merge source (e.g. 15m + 1h): when does it emit (on each input item, or when both have a new item), and how are items paired, given that bootstrap and replay sources are not time-aligned (§5.4)?
+- Split source: what does it split (e.g. one item into several sources)?
 - Could a transformer aggregate candles (e.g. 1m → 5m)? This conflicts with the current decision that timeframes come from the provider.
 - RSI: confirm defaults (`period` 14, on close, Wilder smoothing) and the rounding of the output.
