@@ -10,6 +10,7 @@
 //! Every item carries the running [`Mode`] of the source.
 
 pub mod binance;
+pub mod merge;
 pub mod mock;
 
 use std::fmt;
@@ -37,13 +38,22 @@ pub trait SourceData: fmt::Debug + Clone + Send + Sync + 'static {
 }
 
 /// A data item with its running mode, as given to transformers and conditions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct Item<'a, D> {
     /// The data.
     pub data: &'a D,
     /// Running mode of the source that produced it.
     pub mode: Mode,
 }
+
+// Manual impls: an item only holds a reference, whatever `D` is.
+impl<D> Clone for Item<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D> Copy for Item<'_, D> {}
 
 /// Duration of one candle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +128,24 @@ pub enum SourceInfo {
         /// Transformer description (e.g. `rsi(14)`).
         transformer: String,
     },
+    /// Two sources merged by a [`merge::MergeSource`].
+    Merged {
+        /// The driving source.
+        main: Box<SourceInfo>,
+        /// The slower source.
+        other: Box<SourceInfo>,
+    },
+}
+
+impl SourceInfo {
+    /// Timeframe of the items (for a merge: of the driving source).
+    pub fn timeframe(&self) -> Option<Timeframe> {
+        match self {
+            Self::Provider { timeframe, .. } => Some(*timeframe),
+            Self::Transformed { input, .. } => input.timeframe(),
+            Self::Merged { main, .. } => main.timeframe(),
+        }
+    }
 }
 
 impl fmt::Display for SourceInfo {
@@ -129,6 +157,7 @@ impl fmt::Display for SourceInfo {
                 timeframe,
             } => write!(f, "{provider}:{asset}:{timeframe}"),
             Self::Transformed { input, transformer } => write!(f, "{transformer}<{input}>"),
+            Self::Merged { main, other } => write!(f, "merge<{main}, {other}>"),
         }
     }
 }

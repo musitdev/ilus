@@ -146,8 +146,14 @@ impl<S: Source> DynSource for SourceNode<S> {
 /// A transformer or a condition.
 pub(crate) trait DynProc: Send {
     fn warm_up(&self) -> usize;
-    /// Process one input item; returns the output data, if any.
-    fn process(&mut self, input: &dyn Any, mode: Mode) -> Option<Box<dyn Any + Send>>;
+    /// Process one input item; returns the output data, if any. An item not
+    /// newer than the last processed one is skipped (never the same value twice).
+    fn process(
+        &mut self,
+        input: &dyn Any,
+        mode: Mode,
+        time: DateTime<Utc>,
+    ) -> Option<Box<dyn Any + Send>>;
     fn apply(&mut self, modifier: Box<dyn Any + Send>) -> Result<(), ModifierError>;
 }
 
@@ -155,15 +161,35 @@ fn wrong_modifier() -> ModifierError {
     ModifierError::Rejected("modifier of the wrong type (internal error)".into())
 }
 
-struct TransformerNode<T>(T);
+/// Time of the last item processed by a node; `true` if `time` is newer.
+fn is_new(last: &mut Option<DateTime<Utc>>, time: DateTime<Utc>) -> bool {
+    if last.is_some_and(|l| time <= l) {
+        return false;
+    }
+    *last = Some(time);
+    true
+}
+
+struct TransformerNode<T> {
+    transformer: T,
+    last: Option<DateTime<Utc>>,
+}
 
 impl<T: Transformer> DynProc for TransformerNode<T> {
     fn warm_up(&self) -> usize {
-        self.0.warm_up()
+        self.transformer.warm_up()
     }
-    fn process(&mut self, input: &dyn Any, mode: Mode) -> Option<Box<dyn Any + Send>> {
+    fn process(
+        &mut self,
+        input: &dyn Any,
+        mode: Mode,
+        time: DateTime<Utc>,
+    ) -> Option<Box<dyn Any + Send>> {
+        if !is_new(&mut self.last, time) {
+            return None;
+        }
         let data = input.downcast_ref::<T::Input>()?;
-        let value = self.0.on_data(Item { data, mode });
+        let value = self.transformer.on_data(Item { data, mode });
         Some(Box::new(Derived {
             data: data.clone(),
             value,
@@ -173,26 +199,37 @@ impl<T: Transformer> DynProc for TransformerNode<T> {
         let m = modifier
             .downcast::<T::Modifier>()
             .map_err(|_| wrong_modifier())?;
-        self.0.on_modifier(*m)
+        self.transformer.on_modifier(*m)
     }
 }
 
-struct ConditionNode<C>(C);
+struct ConditionNode<C> {
+    condition: C,
+    last: Option<DateTime<Utc>>,
+}
 
 impl<C: Condition> DynProc for ConditionNode<C> {
     fn warm_up(&self) -> usize {
-        self.0.warm_up()
+        self.condition.warm_up()
     }
-    fn process(&mut self, input: &dyn Any, mode: Mode) -> Option<Box<dyn Any + Send>> {
+    fn process(
+        &mut self,
+        input: &dyn Any,
+        mode: Mode,
+        time: DateTime<Utc>,
+    ) -> Option<Box<dyn Any + Send>> {
+        if !is_new(&mut self.last, time) {
+            return None;
+        }
         let data = input.downcast_ref::<C::Input>()?;
-        let detection = self.0.on_data(Item { data, mode })?;
+        let detection = self.condition.on_data(Item { data, mode })?;
         Some(Box::new(detection))
     }
     fn apply(&mut self, modifier: Box<dyn Any + Send>) -> Result<(), ModifierError> {
         let m = modifier
             .downcast::<C::Modifier>()
             .map_err(|_| wrong_modifier())?;
-        self.0.on_modifier(*m)
+        self.condition.on_modifier(*m)
     }
 }
 
@@ -326,7 +363,10 @@ impl Graph {
             info,
             kind: NodeKind::Proc {
                 input: input.node,
-                node: Box::new(TransformerNode(transformer)),
+                node: Box::new(TransformerNode {
+                    transformer,
+                    last: None,
+                }),
             },
         });
         Output {
@@ -348,7 +388,10 @@ impl Graph {
             info,
             kind: NodeKind::Proc {
                 input: input.node,
-                node: Box::new(ConditionNode(condition)),
+                node: Box::new(ConditionNode {
+                    condition,
+                    last: None,
+                }),
             },
         });
         ConditionOutput {

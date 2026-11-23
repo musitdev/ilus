@@ -5,8 +5,10 @@
 //! (`None` while the transformer warms up). The output keeps the running mode
 //! of its input.
 
+pub mod aggregate;
 #[cfg(feature = "chart")]
 pub mod chart;
+pub mod combine;
 pub mod rsi;
 
 use std::fmt;

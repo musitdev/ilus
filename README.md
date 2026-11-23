@@ -79,11 +79,20 @@ Key properties:
     API key). History is fetched in the background by pages; live candles are
     requested just after each close. `with_bootstrap(n)` (at least `n` warm-up
     candles), `replay(from, to)` (backtest), `with_endpoint(url)`.
+  - `MergeSource`: combines a driving source and a slower one (e.g. 15m + 1h)
+    into one source. Each driving item comes with the last slower item
+    already closed (no look-ahead); driving items wait until the slower data
+    is there, so pairing is correct even when the sources are not aligned.
   - `MockSource`: items from memory (`replay` or `live`), for tests and
     examples.
 - **Transformers**
   - `Rsi`: RSI (Wilder smoothing, default period 14). Output: `RsiCandle`
     (candle + RSI).
+  - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
+    complete periods are sent.
+  - `Combine`: runs 2 or 3 transformers on the same input as one node.
+    Adapters `OnMain`, `OnOther` (sides of a merged item) and `OnValue` (value
+    of a transformer output) never process the same value twice.
   - `Chart` (feature `chart`): shows candles, RSI and trade markers in a native
     window.
 - **Conditions**
@@ -96,8 +105,12 @@ Key properties:
 - **Actions**
   - `Alert`: prints the trigger event. Works with any condition.
 
+Splitting a source needs no special entity: one output can feed several
+consumers (fan-out). A transformer or a condition never processes the same
+value twice.
+
 Planned in the spec but not implemented yet: the 13 candlestick pattern
-conditions (spec F0), and the merge / split sources (spec F1).
+conditions (spec F0).
 
 ---
 
@@ -179,10 +192,12 @@ cargo run --example flow_modes
 |---|---|
 | `binance_sol_rsi` | SOL/USDT 1m → RSI(14); prints every candle with its RSI (the bootstrap candles first), and alerts on live candles when RSI < 30 or > 70. |
 | `rsi_divergence` | SOL/USDT 1m → RSI(14) → divergence detection; prints each divergence detected on the live feed. |
+| `merge_rsi` | SOL/USDT 15m + 1h merged, with an RSI on each timeframe; prints when RSI 15m < 30 and RSI 1h < 40 (replay of the last days). |
 
 ```sh
 cargo run --example binance_sol_rsi     # Ctrl+C to stop
 cargo run --example rsi_divergence      # Ctrl+C to stop
+cargo run --example merge_rsi -- 7      # last 7 days
 ```
 
 ### Backtests on Binance history
@@ -261,10 +276,13 @@ src/
   executor.rs         Executor (ticks), Clock
   source.rs           Source trait, Mode, Item, Timeframe, aligned schedule
   source/binance.rs   Binance source (REST)
+  source/merge.rs     merge source (two timeframes)
   source/mock.rs      mock source
   candle.rs           Candle (OHLCV)
   transformer.rs      Transformer trait, Derived
   transformer/rsi.rs  RSI transformer
+  transformer/aggregate.rs  aggregation (1m -> 5m, ...)
+  transformer/combine.rs    combined transformer and adapters
   transformer/chart.rs chart transformer + window (feature `chart`)
   condition.rs        Condition trait
   condition/divergence.rs  RSI divergence condition

@@ -167,7 +167,7 @@ impl Executor {
                     continue;
                 };
                 let (mode, time) = (input.mode, input.time);
-                let output = node.process(&*input.data, mode);
+                let output = node.process(&*input.data, mode, time);
                 slots[i] = output.map(|data| Slot { data, mode, time });
             }
 

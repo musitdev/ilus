@@ -465,3 +465,107 @@ async fn replay_is_deterministic() {
         assert_eq!(once().await, first);
     }
 }
+
+#[tokio::test]
+async fn a_node_never_processes_the_same_item_twice() {
+    let l = Log::default();
+    let mut g = Graph::new();
+    // Items at 00:00, 00:00 (same time again), 00:01.
+    let mut items = points(&[1, 2, 3]);
+    items[1].time = items[0].time;
+    let src = g.source(MockSource::replay("T", Timeframe::M1, items));
+    let t = g.transform(scale("t", 0, &l), &src);
+    g.condition("c", at_least("c", dec!(1000), 0, &l), &t);
+    run(g).await;
+    assert_eq!(entries(&l), ["t:1", "c:1:Replay", "t:3", "c:3:Replay"]);
+}
+
+mod merge {
+    use super::*;
+    use ilus::source::merge::{MergeSource, Merged};
+    use ilus::transformer::combine::{Combine, OnMain, OnOther};
+
+    /// Counts the calls of its inner logic: value = number of new items seen.
+    struct Counter;
+
+    impl Transformer for Counter {
+        type Input = IndicatorPoint;
+        type Value = Decimal;
+        type Modifier = ilus::modifier::NoModifier;
+        fn name(&self) -> String {
+            "counter".into()
+        }
+        fn warm_up(&self) -> usize {
+            0
+        }
+        fn on_data(&mut self, item: Item<'_, IndicatorPoint>) -> Option<Decimal> {
+            Some(item.data.value)
+        }
+        fn on_modifier(&mut self, m: ilus::modifier::NoModifier) -> Result<(), ModifierError> {
+            match m {}
+        }
+    }
+
+    type Pair = (Option<Decimal>, Option<Decimal>);
+    type Input = Derived<Merged<IndicatorPoint, IndicatorPoint>, Pair>;
+
+    /// Logs the pair (main value, other value) of each merged item.
+    struct LogPair(Log);
+
+    impl Condition for LogPair {
+        type Input = Input;
+        type Value = Hit;
+        type Modifier = ilus::modifier::NoModifier;
+        fn warm_up(&self) -> usize {
+            0
+        }
+        fn on_data(&mut self, item: Item<'_, Input>) -> Option<Detection<Hit>> {
+            let (main, other) = item.data.value?;
+            log(&self.0, format!("{main:?}/{other:?}"));
+            None
+        }
+        fn on_modifier(&mut self, m: ilus::modifier::NoModifier) -> Result<(), ModifierError> {
+            match m {}
+        }
+    }
+
+    fn series(step_min: i64, n: i64) -> Vec<IndicatorPoint> {
+        (0..n)
+            .map(|i| IndicatorPoint {
+                time: epoch() + TimeDelta::minutes(i * step_min),
+                value: Decimal::from(i * step_min),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn merged_source_feeds_a_combined_transformer() {
+        let l = Log::default();
+        let mut g = Graph::new();
+        let merged = g.source(MergeSource::new(
+            MockSource::replay("M", Timeframe::M15, series(15, 8)),
+            MockSource::replay("H", Timeframe::H1, series(60, 2)),
+        ));
+        let both = g.transform(
+            Combine::new((OnMain::new(Counter), OnOther::new(Counter))),
+            &merged,
+        );
+        g.condition("pairs", LogPair(l.clone()), &both);
+        run(g).await;
+        // Values are the minutes of each item; the 1h one changes only when
+        // a new 1h candle is closed (no look-ahead).
+        assert_eq!(
+            entries(&l),
+            [
+                "Some(0)/None",
+                "Some(15)/None",
+                "Some(30)/None",
+                "Some(45)/Some(0)",
+                "Some(60)/Some(0)",
+                "Some(75)/Some(0)",
+                "Some(90)/Some(0)",
+                "Some(105)/Some(60)",
+            ]
+        );
+    }
+}
