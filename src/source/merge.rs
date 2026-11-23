@@ -80,6 +80,15 @@ impl<S: Source> Inner<S> {
     }
 }
 
+/// `ceil(n * from / to)`: how many items of duration `to` cover `n` items of
+/// duration `from` (durations in seconds).
+fn ceil_div(n: usize, from: i64, to: i64) -> usize {
+    let total = i64::try_from(n)
+        .unwrap_or(i64::MAX / 2)
+        .saturating_mul(from);
+    usize::try_from((total + to - 1) / to.max(1)).unwrap_or(n)
+}
+
 /// Start of the period of `timeframe` containing `t` (aligned on the epoch).
 fn floor(t: DateTime<Utc>, timeframe: Timeframe) -> DateTime<Utc> {
     let period = timeframe.duration().num_seconds().max(1);
@@ -98,8 +107,6 @@ pub struct MergeSource<A: Source, B: Source> {
     pending_other: VecDeque<B::Data>,
     /// Last slower item closed at or before the last emitted driving item.
     current: Option<B::Data>,
-    /// Minimum bootstrap of the slower source, in its own items.
-    other_bootstrap: usize,
 }
 
 impl<A: Source, B: Source> MergeSource<A, B> {
@@ -111,17 +118,7 @@ impl<A: Source, B: Source> MergeSource<A, B> {
             queue: VecDeque::new(),
             pending_other: VecDeque::new(),
             current: None,
-            other_bootstrap: 0,
         }
-    }
-
-    /// At least `n` bootstrap items for the slower source (in its own items).
-    /// The graph computes the bootstrap in driving items; use this when a
-    /// transformer on the slower side needs more (e.g. RSI(14) on 1h needs 15
-    /// 1h candles).
-    pub fn with_other_bootstrap(mut self, n: usize) -> Self {
-        self.other_bootstrap = n;
-        self
     }
 
     /// The front driving item can be emitted: the slower source has
@@ -162,21 +159,37 @@ impl<A: Source, B: Source> Source for MergeSource<A, B> {
         }
     }
 
+    /// `items` (computed by the graph, in driving items) and the bootstraps
+    /// set by the user on each inner source (e.g. 15 1h candles for an
+    /// RSI(14) on the slower side) are reconciled so that **every** slower
+    /// bootstrap item is paired with at least one driving item:
+    /// - the slower source covers at least the duration of `items`;
+    /// - the driving source covers the slower bootstrap except its first
+    ///   item, which is paired with the first driving items (e.g. 15 x 1h:
+    ///   14 h = 56 x 15m).
     fn set_bootstrap(&mut self, items: usize) {
-        self.main.source.set_bootstrap(items);
-        // Same duration for the slower source, in its own items, rounded up,
-        // plus the item covering the start.
-        let other_items = match (self.main.timeframe, self.other.timeframe) {
-            (Some(m), Some(o)) => {
-                let (m, o) = (m.duration().num_seconds(), o.duration().num_seconds());
-                let total = i64::try_from(items).unwrap_or(i64::MAX / 2) * m;
-                usize::try_from((total + o - 1) / o.max(1)).unwrap_or(items) + 1
-            }
-            _ => items,
+        let (Some(m), Some(o)) = (self.main.timeframe, self.other.timeframe) else {
+            self.main.source.set_bootstrap(items);
+            self.other.source.set_bootstrap(items);
+            return;
         };
-        self.other
-            .source
-            .set_bootstrap(other_items.max(self.other_bootstrap));
+        let (m, o) = (
+            m.duration().num_seconds().max(1),
+            o.duration().num_seconds().max(1),
+        );
+        let main_items = items.max(self.main.source.bootstrap());
+        // Slower items covering the driving bootstrap, plus the one covering its start.
+        let other_items = ceil_div(main_items, m, o) + 1;
+        self.other.source.set_bootstrap(other_items);
+        // Driving items covering the slower bootstrap (its first item closes
+        // before the first driving item and is paired with it).
+        let other_span = self.other.source.bootstrap().saturating_sub(1);
+        let main_items = main_items.max(ceil_div(other_span, o, m));
+        self.main.source.set_bootstrap(main_items);
+    }
+
+    fn bootstrap(&self) -> usize {
+        self.main.source.bootstrap()
     }
 
     fn mode(&self) -> Mode {
@@ -277,6 +290,9 @@ mod tests {
         fn set_bootstrap(&mut self, items: usize) {
             self.inner.set_bootstrap(items);
         }
+        fn bootstrap(&self) -> usize {
+            self.inner.bootstrap()
+        }
         fn mode(&self) -> Mode {
             self.inner.mode()
         }
@@ -301,8 +317,11 @@ mod tests {
             self.0.info()
         }
         fn set_bootstrap(&mut self, items: usize) {
-            *self.1.lock().unwrap() = items;
             self.0.set_bootstrap(items);
+            *self.1.lock().unwrap() = self.0.bootstrap();
+        }
+        fn bootstrap(&self) -> usize {
+            self.0.bootstrap()
         }
         fn mode(&self) -> Mode {
             self.0.mode()
@@ -385,12 +404,51 @@ mod tests {
         merge.set_bootstrap(8); // 8 x 15m = 2 h -> 2 x 1h, + 1
         assert_eq!(*main.lock().unwrap(), 8);
         assert_eq!(*other.lock().unwrap(), 3);
+    }
 
+    #[test]
+    fn driving_bootstrap_covers_the_slower_bootstrap_set_by_the_user() {
+        // The user asks 15 x 1h (e.g. RSI(14) on 1h): 14 h = 56 x 15m.
+        let main = Arc::new(Mutex::new(0));
         let other = Arc::new(Mutex::new(0));
-        let mut merge =
-            MergeSource::new(m15(10), Probe(h1(10), other.clone())).with_other_bootstrap(15);
-        merge.set_bootstrap(8);
-        assert_eq!(*other.lock().unwrap(), 15, "the explicit minimum wins");
+        let mut merge = MergeSource::new(
+            Probe(m15(100), main.clone()),
+            Probe(h1(30).with_bootstrap(15), other.clone()),
+        );
+        merge.set_bootstrap(4);
+        assert_eq!(*other.lock().unwrap(), 15);
+        assert_eq!(*main.lock().unwrap(), 56);
+    }
+
+    #[test]
+    fn every_slower_bootstrap_item_is_paired() {
+        // 1h bootstrap of 5 set by the user; the merge extends the 15m
+        // bootstrap to 4 h = 16 x 15m. As with a real provider, both
+        // bootstraps end at the same time: 1h 00:00..05:00, 15m 01:00..05:00.
+        let minutes: Vec<i64> = (0..40).map(|i| 60 + i * 15).collect();
+        let main = MockSource::replay("M", Timeframe::M15, points(&minutes));
+        let mut merge = MergeSource::new(main, h1(10).with_bootstrap(5));
+        merge.set_bootstrap(1);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut bootstrap_items = 0;
+        for _ in 0..1000 {
+            match merge.poll(at(0)) {
+                SourcePoll::Ready(m, mode) => {
+                    if mode == Mode::Bootstrap {
+                        bootstrap_items += 1;
+                        if let Some(o) = m.other {
+                            seen.insert(o.time);
+                        }
+                    }
+                }
+                SourcePoll::Pending => {}
+                SourcePoll::Ended => break,
+            }
+        }
+        assert_eq!(bootstrap_items, 16, "4 x 1h = 16 x 15m of bootstrap");
+        // All 5 bootstrap 1h candles are paired (the 5th, 04:00-05:00, closes
+        // with the last bootstrap 15m candle, 04:45-05:00).
+        assert_eq!(seen.len(), 5, "1h candles paired in bootstrap: {seen:?}");
     }
 
     #[test]

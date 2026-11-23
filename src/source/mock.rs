@@ -75,6 +75,10 @@ impl<D: SourceData> Source for MockSource<D> {
         self.bootstrap = self.bootstrap.max(items);
     }
 
+    fn bootstrap(&self) -> usize {
+        self.bootstrap
+    }
+
     fn mode(&self) -> Mode {
         if self.delivered < self.bootstrap && !self.items.is_empty() {
             Mode::Bootstrap

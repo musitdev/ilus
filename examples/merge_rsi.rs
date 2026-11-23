@@ -116,9 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let sol_15m = BinanceSource::new("SOLUSDT", Timeframe::M15).replay(from, to);
-    let sol_1h = BinanceSource::new("SOLUSDT", Timeframe::H1).replay(from, to);
-    // RSI(14) on 1h needs 15 1h candles of warm-up (counted in 1h items).
-    let merged = MergeSource::new(sol_15m, sol_1h).with_other_bootstrap(15);
+    // RSI(14) on 1h needs 15 1h candles of warm-up: set on the 1h source.
+    // The merge extends the 15m bootstrap to cover them (15 h = 60 x 15m).
+    let sol_1h = BinanceSource::new("SOLUSDT", Timeframe::H1)
+        .with_bootstrap(15)
+        .replay(from, to);
+    let merged = MergeSource::new(sol_15m, sol_1h);
 
     let mut g = Graph::new();
     let sol = g.source(merged);

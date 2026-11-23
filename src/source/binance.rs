@@ -145,6 +145,10 @@ impl Source for BinanceSource {
         self.bootstrap = self.bootstrap.max(items);
     }
 
+    fn bootstrap(&self) -> usize {
+        self.bootstrap
+    }
+
     fn mode(&self) -> Mode {
         match &self.state {
             State::Start | State::History(_) if self.replay.is_some() => Mode::Replay,

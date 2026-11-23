@@ -182,9 +182,13 @@ pub trait Source: Send + 'static {
     fn info(&self) -> SourceInfo;
 
     /// Number of bootstrap items needed by the graph (computed from the
-    /// warm-ups, spec §5.4). Called once, before the first call. A source may
-    /// use more.
+    /// warm-ups, spec §5.4). Called once, before the first call. A source
+    /// keeps the largest of this value and the one set by the user.
     fn set_bootstrap(&mut self, items: usize);
+
+    /// Number of bootstrap items this source will deliver (as set by the
+    /// user, e.g. `with_bootstrap`, or by [`set_bootstrap`](Self::set_bootstrap)).
+    fn bootstrap(&self) -> usize;
 
     /// Current running mode: bootstrap and replay sources are called at every
     /// global tick; normal sources when [`next_call`](Self::next_call) is due.
