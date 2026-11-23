@@ -565,7 +565,7 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 **Behavior** (cargo feature `chart`, crates `eframe` + `egui_plot`):
 - `chart(title, indicator_name)` creates a `Chart` transformer and a `ChartWindow`.
 - The transformer accepts candles, or candles with an indicator value (e.g. `RsiCandle`). Like every transformer it forwards every input item (value `()`), and sends each candle to the window.
-- It accepts the modifier `ChartModifier::Marker { time, price, kind, label }`, sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation.
+- It accepts the modifier `ChartModifier::Marker { time, price, kind, label }`, sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation (trades), and bullish / bearish signal (e.g. candlestick patterns). Signals are drawn first, trades on top.
 - The window shows the candles (green up / red down) with the markers, and the indicator in a second panel (with 30/70 lines), both on a shared time axis. It refreshes while data arrives.
 - Navigation: mouse wheel zooms the time axis around the cursor (both panels stay aligned); left-drag pans; right-drag zooms on a box; double-click resets. Toolbar: zoom in / out, *Fit all*, *Last 6h / 1d / 3d*, and *Auto-fit price* (on by default: the price axis fits the visible candles and markers; off: the price axis can be zoomed and dragged freely).
 - The window must run on the main thread; the executor runs in another thread. Closing the window does not stop data forwarding.

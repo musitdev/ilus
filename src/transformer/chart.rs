@@ -76,6 +76,10 @@ pub enum MarkerKind {
     Stop,
     /// Liquidation (purple asterisk).
     Liquidation,
+    /// Bullish signal, e.g. a candlestick pattern (blue triangle up).
+    Bullish,
+    /// Bearish signal, e.g. a candlestick pattern (pink triangle down).
+    Bearish,
 }
 
 /// How a marker kind is drawn.
@@ -90,9 +94,11 @@ struct MarkerStyle {
 }
 
 impl MarkerKind {
-    /// Drawing order: exits first, opens last (on top). A flip closes and
+    /// Drawing order: signals first, then exits, opens last (on top). A flip closes and
     /// opens at the same time and price: the open marker must stay visible.
-    const DRAW_ORDER: [Self; 5] = [
+    const DRAW_ORDER: [Self; 7] = [
+        Self::Bullish,
+        Self::Bearish,
         Self::Close,
         Self::Stop,
         Self::Liquidation,
@@ -141,6 +147,22 @@ impl MarkerKind {
                 9.0,
                 true,
                 false,
+            ),
+            Self::Bullish => (
+                "bullish signal",
+                MarkerShape::Up,
+                Color32::from_rgb(80, 170, 255),
+                7.0,
+                true,
+                true,
+            ),
+            Self::Bearish => (
+                "bearish signal",
+                MarkerShape::Down,
+                Color32::from_rgb(255, 110, 200),
+                7.0,
+                true,
+                true,
             ),
         };
         MarkerStyle {
@@ -778,7 +800,7 @@ mod tests {
             }
         }
         // Every kind is drawn exactly once.
-        assert_eq!(MarkerKind::DRAW_ORDER.len(), 5);
+        assert_eq!(MarkerKind::DRAW_ORDER.len(), 7);
         // The close ring is smaller and hollow, so a triangle at the same point stays visible.
         let (close, buy) = (MarkerKind::Close.style(), MarkerKind::Buy.style());
         assert!(!close.filled && close.radius < buy.radius);

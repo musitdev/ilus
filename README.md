@@ -274,6 +274,16 @@ cargo run --features chart --example chart_futures -- --from 2026-09-22 --to 202
 
 - Markers: green ▲ long, red ▼ short, grey ○ close, orange ✕ stop-loss,
   purple ✱ liquidation.
+
+**`chart_patterns`** shows the candlestick patterns detected on SOL/USDT
+history, to inspect them: a blue ▲ under the low for bullish patterns, a pink ▼
+above the high for bearish ones, on the candle that confirms them. The label
+lists the patterns (several can match the same candle).
+
+```sh
+cargo run --features chart --example chart_patterns -- [days] [timeframe]
+cargo run --features chart --example chart_patterns -- 2 15m
+```
 - Navigation:
   - mouse wheel: zoom the time axis;
   - left-drag: pan;
