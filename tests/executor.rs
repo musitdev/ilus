@@ -162,11 +162,14 @@ impl<I: Val> Condition for AtLeast<I> {
             value: Hit(v),
         })
     }
-    fn on_modifier(&mut self, m: SetThreshold) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: SetThreshold,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {
             SetThreshold::To(t) => {
                 self.threshold = t;
-                Ok(())
+                Ok(None)
             }
             SetThreshold::Invalid => Err(ModifierError::Rejected("invalid".into())),
         }
@@ -581,7 +584,10 @@ mod merge {
             log(&self.0, format!("{main:?}/{other:?}"));
             None
         }
-        fn on_modifier(&mut self, m: ilus::modifier::NoModifier) -> Result<(), ModifierError> {
+        fn on_modifier(
+            &mut self,
+            m: ilus::modifier::NoModifier,
+        ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
             match m {}
         }
     }
@@ -633,4 +639,206 @@ async fn run_from_an_async_task_is_an_error() {
     g.source(replay(&[1]));
     let result = Executor::new(g).with_clock(Clock::Simulated(epoch())).run();
     assert!(result.is_err(), "the executor must run on its own thread");
+}
+
+mod triggered_by_modifier {
+    use super::*;
+    use ilus::modifier::NoModifier;
+
+    #[derive(Debug)]
+    struct Arm;
+    impl ModifierValue for Arm {}
+
+    /// Triggers when armed and its last value is below `threshold`: a
+    /// modifier (`Arm`) is one of its rules, like the data.
+    struct ArmedBelow {
+        name: &'static str,
+        threshold: Decimal,
+        armed: bool,
+        last: Option<Decimal>,
+        log: Log,
+    }
+
+    fn armed_below(name: &'static str, threshold: i64, log: &Log) -> ArmedBelow {
+        ArmedBelow {
+            name,
+            threshold: Decimal::from(threshold),
+            armed: false,
+            last: None,
+            log: log.clone(),
+        }
+    }
+
+    impl ArmedBelow {
+        fn check(&self) -> Option<Detection<Hit>> {
+            let v = self.last?;
+            (self.armed && v < self.threshold).then_some(Detection {
+                event_type: TriggerEventType::Other("armed_below"),
+                value: Hit(v),
+            })
+        }
+    }
+
+    impl Condition for ArmedBelow {
+        type Input = IndicatorPoint;
+        type Value = Hit;
+        type Modifier = Arm;
+
+        fn warm_up(&self) -> usize {
+            0
+        }
+        fn on_data(&mut self, item: Item<'_, IndicatorPoint>) -> Option<Detection<Hit>> {
+            self.last = Some(item.data.value);
+            log(&self.log, format!("{}:data:{}", self.name, item.data.value));
+            self.check()
+        }
+        fn on_modifier(&mut self, _: Arm) -> Result<Option<Detection<Hit>>, ModifierError> {
+            self.armed = true;
+            log(&self.log, format!("{}:armed", self.name));
+            Ok(self.check())
+        }
+    }
+
+    /// Triggers when the value is below `threshold` (no modifier).
+    struct Below(Decimal);
+
+    impl Condition for Below {
+        type Input = IndicatorPoint;
+        type Value = Hit;
+        type Modifier = NoModifier;
+
+        fn warm_up(&self) -> usize {
+            0
+        }
+        fn on_data(&mut self, item: Item<'_, IndicatorPoint>) -> Option<Detection<Hit>> {
+            (item.data.value < self.0).then_some(Detection {
+                event_type: TriggerEventType::Other("below"),
+                value: Hit(item.data.value),
+            })
+        }
+        fn on_modifier(&mut self, m: NoModifier) -> Result<Option<Detection<Hit>>, ModifierError> {
+            match m {}
+        }
+    }
+
+    /// Logs the event (value and tick time) and arms `target`, if any.
+    struct ArmOther {
+        name: &'static str,
+        target: Option<ModifierHandle<Arm>>,
+        log: Log,
+    }
+
+    fn arm_other(name: &'static str, target: Option<ModifierHandle<Arm>>, log: &Log) -> ArmOther {
+        ArmOther {
+            name,
+            target,
+            log: log.clone(),
+        }
+    }
+
+    impl Action for ArmOther {
+        type Value = Hit;
+        type Input = IndicatorPoint;
+
+        fn run(
+            &mut self,
+            event: TriggerEvent<'_, Hit, IndicatorPoint>,
+            ctx: &mut ActionContext,
+        ) -> Result<(), ActionError> {
+            log(
+                &self.log,
+                format!(
+                    "{}:{}:{}",
+                    self.name,
+                    event.value.0,
+                    ctx.now().timestamp_millis()
+                ),
+            );
+            if let Some(target) = &self.target {
+                ctx.send(target, Arm);
+            }
+            Ok(())
+        }
+    }
+
+    fn tick_of(entry: &str) -> String {
+        entry.rsplit(':').next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn a_modifier_from_another_chain_triggers_in_the_same_tick() {
+        let l = Log::default();
+        let mut g = Graph::new();
+        // Chain K (e.g. Kucoin RSI 1h): its value is already low (25).
+        let k = g.source(replay(&[40, 25]));
+        let k_cond = g.condition("k", armed_below("k", 30, &l), &k);
+        let k_handle = g.modifier_handle(&k_cond);
+        g.action(arm_other("k-action", None, &l), &k_cond);
+        // Chain B (e.g. Binance RSI 15m): triggers on its 2nd item, arms K.
+        let b = g.source(replay(&[50, 20]));
+        let b_cond = g.condition("b", Below(dec!(30)), &b);
+        g.action(arm_other("b-action", Some(k_handle), &l), &b_cond);
+        run(g);
+
+        let log = entries(&l);
+        let pos = |p: &str| log.iter().position(|e| e.starts_with(p)).unwrap();
+        let (b_event, k_event) = (pos("b-action:"), pos("k-action:"));
+        // In the same tick: K processed its 2nd item (not armed yet), B
+        // triggered, the modifier armed K, which triggered at once with its
+        // last item (25).
+        assert!(pos("k:data:25") < b_event);
+        assert!(b_event < pos("k:armed"));
+        assert!(pos("k:armed") < k_event);
+        assert!(log[k_event].starts_with("k-action:25:"));
+        assert_eq!(tick_of(&log[b_event]), tick_of(&log[k_event]));
+    }
+
+    #[test]
+    fn modifiers_cascade_in_rounds_within_the_tick() {
+        let l = Log::default();
+        let mut g = Graph::new();
+        let src = g.source(replay(&[10]));
+        // c3 <- c2 <- c1: each action arms the next condition.
+        let c3 = g.condition("c3", armed_below("c3", 100, &l), &src);
+        let h3 = g.modifier_handle(&c3);
+        g.action(arm_other("a3", None, &l), &c3);
+        let c2 = g.condition("c2", armed_below("c2", 100, &l), &src);
+        let h2 = g.modifier_handle(&c2);
+        g.action(arm_other("a2", Some(h3), &l), &c2);
+        let c1 = g.condition("c1", Below(dec!(100)), &src);
+        g.action(arm_other("a1", Some(h2), &l), &c1);
+        run(g);
+        let actions: Vec<String> = entries(&l)
+            .into_iter()
+            .filter(|e| e.starts_with('a'))
+            .collect();
+        assert_eq!(actions.len(), 3);
+        assert!(actions[0].starts_with("a1:10:"));
+        assert!(actions[1].starts_with("a2:10:"));
+        assert!(actions[2].starts_with("a3:10:"));
+        assert!(actions.iter().all(|a| tick_of(a) == tick_of(&actions[0])));
+    }
+
+    #[test]
+    fn modifier_rounds_are_limited_per_tick() {
+        let l = Log::default();
+        let mut g = Graph::new();
+        let src = g.source(replay(&[10, 10]));
+        // Two conditions that keep arming each other: an endless cascade.
+        let c1 = g.condition("c1", armed_below("c1", 100, &l), &src);
+        let c2 = g.condition("c2", armed_below("c2", 100, &l), &src);
+        let (h1, h2) = (g.modifier_handle(&c1), g.modifier_handle(&c2));
+        g.action(arm_other("a1", Some(h2), &l), &c1);
+        g.action(arm_other("a2", Some(h1), &l), &c2);
+        let starter = g.condition("start", Below(dec!(100)), &src);
+        g.action(arm_other("s", Some(h1), &l), &starter);
+        run(g); // must end
+        let first_tick: Vec<String> = entries(&l)
+            .into_iter()
+            .filter(|e| e.starts_with("a1:") || e.starts_with("a2:"))
+            .collect();
+        let t0 = tick_of(&first_tick[0]);
+        let in_first_tick = first_tick.iter().filter(|e| tick_of(e) == t0).count();
+        assert_eq!(in_first_tick, ilus::executor::MAX_MODIFIER_ROUNDS);
+    }
 }

@@ -67,11 +67,14 @@ impl Condition for CloseAbove {
         })
     }
 
-    fn on_modifier(&mut self, modifier: CloseAboveModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        modifier: CloseAboveModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match modifier {
             CloseAboveModifier::SetThreshold(t) if t > Decimal::ZERO => {
                 self.threshold = t;
-                Ok(())
+                Ok(None)
             }
             CloseAboveModifier::SetThreshold(t) => Err(ModifierError::Rejected(format!(
                 "threshold must be > 0, got {t}"
@@ -169,7 +172,10 @@ impl Condition for SmaAbove {
         })
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }

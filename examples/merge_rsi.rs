@@ -69,7 +69,10 @@ impl Condition for BothLow {
         })
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }

@@ -13,8 +13,11 @@
 //! 2. evaluate the downstream transformers and conditions, in graph order;
 //! 3. run the actions of the conditions that triggered (except for bootstrap
 //!    items), in graph order;
-//! 4. apply the modifiers produced during the tick, then those sent by async
-//!    work since the previous tick, in arrival order;
+//! 4. modifier rounds: apply the modifiers produced during the tick (and those
+//!    sent by async work since the previous tick), in order; a condition may
+//!    trigger on a modifier: its actions run, with its last input item, and may
+//!    send new modifiers, applied in a new round (at most
+//!    [`MAX_MODIFIER_ROUNDS`] rounds per tick);
 //! 5. wait for the next tick.
 //!
 //! While a source is in bootstrap or replay mode, ticks are global and run
@@ -38,6 +41,11 @@ pub const DEFAULT_TICK: Duration = Duration::from_millis(10);
 
 /// Default number of threads of the async runtime.
 pub const DEFAULT_ASYNC_THREADS: usize = 1;
+
+/// Max modifier rounds in one tick (a modifier can make a condition trigger,
+/// whose actions can send modifiers...). Beyond it, the remaining modifiers are
+/// applied at the next tick.
+pub const MAX_MODIFIER_ROUNDS: usize = 16;
 
 /// How long the async work may still run after the last tick.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -167,6 +175,8 @@ impl Executor {
         let mut slots: Vec<Option<Slot>> = (0..n).map(|_| None).collect();
         let mut ended = vec![false; n];
         let mut next_due: Vec<Option<DateTime<Utc>>> = vec![None; n];
+        // Modifiers beyond the round limit, applied at the next tick.
+        let mut carried: Vec<Envelope> = Vec::new();
 
         loop {
             let now = clock.now();
@@ -240,22 +250,80 @@ impl Executor {
                 }
             }
 
-            // 4. Modifiers of this tick, then those from background tasks.
-            let mut modifiers = std::mem::take(&mut ctx.modifiers);
+            // 4. Modifier rounds: apply the modifiers (carried from the
+            //    previous tick, of this tick, from async work), in order; the
+            //    conditions they make trigger run their actions, which may send
+            //    new modifiers: next round, until none is left.
+            let mut modifiers = std::mem::take(&mut carried);
+            modifiers.append(&mut ctx.modifiers);
             while let Ok(m) = deferred_rx.try_recv() {
                 modifiers.push(m);
             }
-            for (target, modifier) in modifiers {
-                let Some(node) = nodes.get_mut(target) else {
-                    continue;
-                };
-                if let NodeKind::Proc {
-                    node: proc_node, ..
-                } = &mut node.kind
-                    && let Err(e) = proc_node.apply(modifier)
-                {
-                    eprintln!("[{}] {e}", node.name);
+            let mut round = 0;
+            while !modifiers.is_empty() {
+                if round == MAX_MODIFIER_ROUNDS {
+                    eprintln!(
+                        "[executor] more than {MAX_MODIFIER_ROUNDS} modifier rounds in one tick: {} modifiers carried to the next tick",
+                        modifiers.len()
+                    );
+                    carried = modifiers;
+                    break;
                 }
+                round += 1;
+                // Apply; collect the detections.
+                let mut triggered = Vec::new();
+                for (target, modifier) in modifiers.drain(..) {
+                    let Some(node) = nodes.get_mut(target) else {
+                        continue;
+                    };
+                    let NodeKind::Proc {
+                        node: proc_node, ..
+                    } = &mut node.kind
+                    else {
+                        continue;
+                    };
+                    match proc_node.apply(modifier) {
+                        Ok(Some(detection)) => triggered.push((target, detection)),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("[{}] {e}", node.name),
+                    }
+                }
+                // Run the actions of the conditions that triggered, with their
+                // last input item.
+                let mut round_ctx = ActionContext::new(deferred_tx.clone(), handle.clone(), now);
+                for (c, detection) in &triggered {
+                    let Some(node) = nodes.get(*c) else { continue };
+                    let NodeKind::Proc {
+                        node: proc_node, ..
+                    } = &node.kind
+                    else {
+                        continue;
+                    };
+                    let Some((data, mode, time)) = proc_node.last_input() else {
+                        eprintln!(
+                            "[{}] triggered by a modifier before any data: detection dropped",
+                            node.name
+                        );
+                        continue;
+                    };
+                    if mode == Mode::Bootstrap {
+                        continue;
+                    }
+                    for action in actions.iter_mut().filter(|a| a.condition() == *c) {
+                        let input = ActionInput {
+                            detection: &**detection,
+                            data,
+                            condition: &node.name,
+                            source: &node.info,
+                            time,
+                            mode,
+                        };
+                        if let Err(e) = action.run(input, &mut round_ctx) {
+                            eprintln!("[{}] {e}", node.name);
+                        }
+                    }
+                }
+                modifiers = std::mem::take(&mut round_ctx.modifiers);
             }
 
             if !active {

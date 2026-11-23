@@ -58,7 +58,10 @@ impl Condition for WithTicks {
         })
     }
 
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }

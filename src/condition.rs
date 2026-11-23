@@ -10,7 +10,8 @@ use crate::trigger::{Detection, TriggerValue};
 /// A sync detector with exactly one input in the graph.
 ///
 /// It is called for every new input item, including bootstrap items (to warm
-/// up its state); detections of bootstrap items are not sent to actions.
+/// up its state); detections of bootstrap items are not sent to actions. It can
+/// also trigger when it receives a modifier (see [`Condition::on_modifier`]).
 pub trait Condition: Send + 'static {
     /// Type of data item consumed.
     type Input: SourceData;
@@ -26,7 +27,12 @@ pub trait Condition: Send + 'static {
     /// Called for each new input item.
     fn on_data(&mut self, item: Item<'_, Self::Input>) -> Option<Detection<Self::Value>>;
 
-    /// Called at the end of a tick for each modifier sent to it.
+    /// Called at the end of a tick for each modifier sent to it. A modifier is
+    /// one of the condition's rules: it may make the condition trigger, in
+    /// which case its actions run in the same tick, with the last input item.
     /// An invalid modifier must be rejected and leave the condition unchanged.
-    fn on_modifier(&mut self, modifier: Self::Modifier) -> Result<(), ModifierError>;
+    fn on_modifier(
+        &mut self,
+        modifier: Self::Modifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError>;
 }

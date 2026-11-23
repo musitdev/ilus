@@ -41,7 +41,9 @@ The executor runs **ticks**. A tick is fully sequential:
 1. call the due sources (each returns zero or one new item);
 2. run the transformers and conditions fed by the new items, in graph order;
 3. run the actions of the conditions that triggered;
-4. apply the modifiers produced during the tick;
+4. apply the modifiers produced during the tick. A modifier is one of the
+   rules of a condition: if it makes the condition trigger, its actions run in
+   the same tick (and their modifiers are applied in turn);
 5. wait for the next tick.
 
 Each source has a **running mode**, carried by every item it produces:
@@ -182,6 +184,7 @@ through the graph.
 | `simple` | Every building block together: one source feeding two branches (fan-out), a transformer (SMA), and an action that sends a modifier back to its condition. |
 | `flow_chain` | A chain source → transformer → transformer → condition within one tick; bootstrap items go through the chain without action events. |
 | `flow_modifier` | The action → modifier → condition loop (the condition switches between oversold and overbought); the modifier is applied before the next candle; an invalid one is rejected. |
+| `flow_cross` | Two independent chains: an action of one chain arms a condition of the other with a modifier, and that condition triggers in the same tick. |
 | `flow_slow_action` | A slow (blocking) action makes the tick longer: nothing is queued, nothing is lost; a failing action does not stop the next tick. |
 | `flow_parallel` | Two sources in one graph: one item each per tick, called one after the other. |
 | `flow_modes` | Bootstrap, then normal (live) mode with calls just after each candle close (simulated clock, instant). |
@@ -190,6 +193,7 @@ through the graph.
 cargo run --example simple
 cargo run --example flow_chain
 cargo run --example flow_modifier
+cargo run --example flow_cross
 cargo run --example flow_slow_action
 cargo run --example flow_parallel
 cargo run --example flow_modes

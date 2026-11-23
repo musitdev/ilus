@@ -50,7 +50,10 @@ impl Condition for EveryCandle {
             value: CandleIdx(idx(item.data)),
         })
     }
-    fn on_modifier(&mut self, m: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {}
     }
 }

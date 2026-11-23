@@ -153,7 +153,16 @@ pub(crate) trait DynProc: Send {
         mode: Mode,
         time: DateTime<Utc>,
     ) -> Option<Box<dyn Any + Send>>;
-    fn apply(&mut self, modifier: Box<dyn Any + Send>) -> Result<(), ModifierError>;
+    /// Apply a modifier; a condition may return a detection.
+    fn apply(
+        &mut self,
+        modifier: Box<dyn Any + Send>,
+    ) -> Result<Option<Box<dyn Any + Send>>, ModifierError>;
+    /// Last input item processed by a condition (for events triggered by a
+    /// modifier): data, mode, time.
+    fn last_input(&self) -> Option<(&(dyn Any + Send), Mode, DateTime<Utc>)> {
+        None
+    }
 }
 
 fn wrong_modifier() -> ModifierError {
@@ -194,17 +203,22 @@ impl<T: Transformer> DynProc for TransformerNode<T> {
             value,
         }))
     }
-    fn apply(&mut self, modifier: Box<dyn Any + Send>) -> Result<(), ModifierError> {
+    fn apply(
+        &mut self,
+        modifier: Box<dyn Any + Send>,
+    ) -> Result<Option<Box<dyn Any + Send>>, ModifierError> {
         let m = modifier
             .downcast::<T::Modifier>()
             .map_err(|_| wrong_modifier())?;
-        self.transformer.on_modifier(*m)
+        self.transformer.on_modifier(*m).map(|()| None)
     }
 }
 
-struct ConditionNode<C> {
+struct ConditionNode<C: Condition> {
     condition: C,
     last: Option<DateTime<Utc>>,
+    /// Copy of the last input item (for events triggered by a modifier).
+    last_input: Option<(C::Input, Mode, DateTime<Utc>)>,
 }
 
 impl<C: Condition> DynProc for ConditionNode<C> {
@@ -221,14 +235,24 @@ impl<C: Condition> DynProc for ConditionNode<C> {
             return None;
         }
         let data = input.downcast_ref::<C::Input>()?;
+        self.last_input = Some((data.clone(), mode, time));
         let detection = self.condition.on_data(Item { data, mode })?;
         Some(Box::new(detection))
     }
-    fn apply(&mut self, modifier: Box<dyn Any + Send>) -> Result<(), ModifierError> {
+    fn apply(
+        &mut self,
+        modifier: Box<dyn Any + Send>,
+    ) -> Result<Option<Box<dyn Any + Send>>, ModifierError> {
         let m = modifier
             .downcast::<C::Modifier>()
             .map_err(|_| wrong_modifier())?;
-        self.condition.on_modifier(*m)
+        let detection = self.condition.on_modifier(*m)?;
+        Ok(detection.map(|d| Box::new(d) as Box<dyn Any + Send>))
+    }
+    fn last_input(&self) -> Option<(&(dyn Any + Send), Mode, DateTime<Utc>)> {
+        self.last_input
+            .as_ref()
+            .map(|(data, mode, time)| (data as &(dyn Any + Send), *mode, *time))
     }
 }
 
@@ -377,6 +401,7 @@ impl Graph {
                 node: Box::new(ConditionNode {
                     condition,
                     last: None,
+                    last_input: None,
                 }),
             },
         });

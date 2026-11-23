@@ -117,11 +117,13 @@ A tick is **fully sequential**:
 1. **Sources**: call every due source; each returns zero or one item.
 2. **Transformers and conditions**: for each new item, evaluate the downstream nodes in graph order. Each node runs at most once per item.
 3. **Actions**: for every detection (except from bootstrap items), run the connected actions, in graph order (sync, on the executor thread).
-4. **Modifiers**: apply every modifier produced during the tick (and results of background action work received meanwhile), in the order they were sent.
+4. **Modifier rounds**: apply the modifiers produced during the tick (then those sent by async work since the previous tick), in the order they were sent. A modifier is one of the rules of a condition: when applying it makes the condition trigger, its actions run **in the same tick**, with the condition's **last input item**. Modifiers sent by these actions are applied in a new round, and so on until none is left (at most `MAX_MODIFIER_ROUNDS` = 16 rounds per tick; the rest is applied at the next tick, with a log).
 5. Next tick.
 
 Consequences:
-- A modifier is always applied **before the next tick**, in every mode: execution is deterministic, also in bootstrap and replay.
+- A modifier is always applied **within the tick in which it is produced** (before the next tick), in every mode: execution is deterministic, also in bootstrap and replay.
+- What triggers a condition does not matter (new data, a modifier from another chain, the result of async work): its actions run with its last input item. A detection caused by a modifier before any data is dropped (logged); it cannot happen after the bootstrap.
+- Example: chain B (Binance RSI 15m) arms, with a modifier, a condition of chain K (Kucoin RSI 1h) whose last RSI is already low: K triggers in the same tick, even if K has just processed a candle in that tick.
 - Nothing piles up between entities: there is no event queue and no backpressure mechanism. A slow action simply makes the tick longer; the next tick waits.
 
 ### 5.6 End of execution
@@ -134,8 +136,10 @@ Consequences:
 - [ ] Bootstrap items reach conditions but produce no action event; replay and normal items do.
 - [ ] Bootstrap and replay: one item per source per global tick, sources called in graph order.
 - [ ] Normal: a source is called at candle close + delay, then every half period until the candle is available.
-- [ ] Within a tick: sources, then transformers and conditions, then actions, then modifiers.
-- [ ] A modifier produced during a tick is applied before the next tick, in every mode.
+- [ ] Within a tick: sources, then transformers and conditions, then actions, then modifier rounds.
+- [ ] A modifier produced during a tick is applied in that tick, in every mode.
+- [ ] A condition can trigger on a modifier: its actions run in the same tick, with its last input item; their modifiers are applied in the next round.
+- [ ] Modifier rounds are limited per tick; the remaining modifiers are applied at the next tick.
 - [ ] Every detection (except bootstrap) reaches its actions; none is lost.
 - [ ] Bootstrap length per source = max over downstream paths of the sum of warm-ups.
 - [ ] The executor stops when all sources have ended.
@@ -199,7 +203,9 @@ trait Condition: Send + 'static {
     /// Items needed before the first possible detection (bootstrap length).
     fn warm_up(&self) -> usize;
     fn on_data(&mut self, item: Item<'_, Self::Input>) -> Option<Detection<Self::Value>>;
-    fn on_modifier(&mut self, m: Self::Modifier) -> Result<(), ModifierError>;
+    /// A modifier is one of its rules: it may make the condition trigger.
+    fn on_modifier(&mut self, m: Self::Modifier)
+        -> Result<Option<Detection<Self::Value>>, ModifierError>;
 }
 struct Detection<V> { event_type: TriggerEventType, value: V }
 
@@ -391,6 +397,7 @@ struct Executor { /* graph, tick, clock */ }
 - It keeps whatever internal state it needs (history window, indicators…).
 - When it detects its situation, it emits a **detection**, turned into a trigger event for every connected action (§5.5). It emits at most one detection per item; a condition may emit detections of different types (e.g. one pattern condition can detect several patterns).
 - In **bootstrap** mode it only updates its state: its detections are not sent to actions (§5.3). It can read the running mode of the item.
+- It can also **trigger when it receives a modifier** (`on_modifier` may return a detection): a modifier is one of its rules, like the data. Its actions then run in the same tick, with its last input item (§5.5). Avoiding a double trigger (e.g. a repeated modifier) is part of the condition's rules.
 - A condition knows nothing about providers, transformers or actions; it only sees data items, produces events and receives modifiers (F5).
 - Each condition instance is independent: same type with different parameters = different instances.
 - First kind provided: candlestick patterns (F0). Other kinds may be added later.
@@ -486,7 +493,7 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 - Each condition or transformer type defines the modifiers it accepts; a mismatch is a compile error.
 - Each condition type defines the modifiers it accepts (its own modifier type); their meaning is specific to the condition.
 - Modifiers are delivered **in the order they were sent**.
-- Modifiers produced during a tick are applied at the **end of that tick**, after the actions, in send order (§5.5); they never interrupt a node. They affect the next ticks only.
+- Modifiers produced during a tick are applied at the **end of that tick**, after the actions, in send order (§5.5); they never interrupt a node. A condition may trigger on a modifier, in the same tick (modifier rounds, §5.5); otherwise the modifier affects the next ticks.
 - Modifier effects live in memory only: on restart, conditions start again from their definition in code.
 
 **Example** (pattern condition): an action receives a *Bullish Engulfing* event, sends `WatchOnly(Bearish)`, then finishes. From the next candle, the condition only triggers on bearish patterns.
@@ -583,7 +590,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 - One input per transformer and per condition. A merge source (built from two sources before the graph, paired by time without look-ahead) combines sources; a combined transformer runs several transformers as one node; split is fan-out; an aggregation transformer builds longer timeframes. No merge or split of transformer outputs.
 - A transformer or a condition never processes the same value twice: the executor skips items not newer than the last processed; adapters check the part they read. Fan-out allowed: one output feeds many consumers, read by reference. An action is connected to exactly one condition (one instance per condition) and can have state.
 - Bootstrap length computed from the graph: max over downstream paths of the sum of the warm-ups. The user can ask for more on each source (`with_bootstrap`), e.g. behind a merge; the merge reconciles the bootstraps of its two sources.
-- Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the end of the tick, after the actions; in memory only.
+- Modifiers: sent mostly by actions to a condition or a transformer through typed handles; applied at the end of the tick, after the actions, in rounds (a condition may trigger on a modifier, its actions run in the same tick); in memory only.
 - Binance data over REST only (bootstrap/replay by pages, live polling); no WebSocket.
 - Timeframes are requested from the provider, fixed at startup.
 - A condition emits one event at a time, possibly of different event types.

@@ -96,17 +96,20 @@ impl Condition for RsiBand {
         })
     }
 
-    fn on_modifier(&mut self, m: BandModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        m: BandModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match m {
             BandModifier::Watch(side) => {
                 log("condition", format!("modifier applied: watch {side:?}"));
                 self.side = side;
-                Ok(())
+                Ok(None)
             }
             BandModifier::SetLow(v) if (Decimal::ZERO..=Decimal::ONE_HUNDRED).contains(&v) => {
                 log("condition", format!("modifier applied: low={v}"));
                 self.low = v;
-                Ok(())
+                Ok(None)
             }
             BandModifier::SetLow(v) => {
                 log("condition", format!("modifier REJECTED: low={v}"));

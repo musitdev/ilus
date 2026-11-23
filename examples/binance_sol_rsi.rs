@@ -71,7 +71,10 @@ impl Condition for RsiExtreme {
         })
     }
 
-    fn on_modifier(&mut self, modifier: NoModifier) -> Result<(), ModifierError> {
+    fn on_modifier(
+        &mut self,
+        modifier: NoModifier,
+    ) -> Result<Option<Detection<Self::Value>>, ModifierError> {
         match modifier {}
     }
 }
