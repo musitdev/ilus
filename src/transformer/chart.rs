@@ -18,7 +18,6 @@
 //!
 //! Prices are converted to `f64` for display only.
 
-use std::marker::PhantomData;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -37,7 +36,20 @@ use crate::modifier::ModifierValue;
 use crate::source::{Item, SourceData};
 use crate::transformer::{Derived, Transformer};
 
-/// Items the chart can display: a candle and an optional indicator value.
+/// What the chart draws for one item: the candle, curves drawn over the price
+/// (e.g. EMAs) and a value for the indicator panel (e.g. RSI).
+#[derive(Debug, Clone)]
+pub struct ChartFrame<'a> {
+    /// The candle.
+    pub candle: &'a Candle,
+    /// Curves over the price, in the order of the names given to [`chart_with`].
+    pub overlays: Vec<Option<Decimal>>,
+    /// Value of the indicator panel.
+    pub indicator: Option<Decimal>,
+}
+
+/// Items the chart can display with [`chart`]: a candle and an optional
+/// indicator value. For other items, use [`chart_with`].
 pub trait ChartData: SourceData {
     /// The candle to draw.
     fn candle(&self) -> &Candle;
@@ -189,11 +201,37 @@ pub struct Marker {
     pub label: String,
 }
 
+/// Panel of a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartPanel {
+    /// The price panel.
+    Price,
+    /// The indicator panel.
+    Indicator,
+}
+
+/// A segment between two points of a panel (e.g. the two pivots of a divergence).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    /// Panel to draw it in.
+    pub panel: ChartPanel,
+    /// Start: time and value.
+    pub from: (DateTime<Utc>, Decimal),
+    /// End: time and value.
+    pub to: (DateTime<Utc>, Decimal),
+    /// Colour, as the marker of this kind.
+    pub kind: MarkerKind,
+    /// Short text shown at the end.
+    pub label: String,
+}
+
 /// Modifiers accepted by the [`Chart`] transformer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChartModifier {
-    /// Draw a trade marker.
+    /// Draw a marker (trade, signal).
     Marker(Marker),
+    /// Draw a segment.
+    Segment(Segment),
 }
 
 impl ModifierValue for ChartModifier {}
@@ -206,6 +244,7 @@ enum Msg {
         high: f64,
         low: f64,
         close: f64,
+        overlays: Vec<Option<f64>>,
         indicator: Option<f64>,
     },
     Marker {
@@ -214,6 +253,16 @@ enum Msg {
         kind: MarkerKind,
         label: String,
     },
+    Segment(SegmentPoint),
+}
+
+#[derive(Debug, Clone)]
+struct SegmentPoint {
+    panel: ChartPanel,
+    from: [f64; 2],
+    to: [f64; 2],
+    kind: MarkerKind,
+    label: String,
 }
 
 fn f(v: Decimal) -> f64 {
@@ -224,12 +273,33 @@ fn x(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64
 }
 
-/// Create a chart transformer and its window.
-/// `indicator` names the indicator panel (e.g. `"RSI"`); it is shown only if
-/// the items carry an indicator value.
+/// Frame of a [`ChartData`] item: its candle and indicator, no curve.
+fn frame_of<I: ChartData>(item: &I) -> ChartFrame<'_> {
+    ChartFrame {
+        candle: item.candle(),
+        overlays: Vec::new(),
+        indicator: item.indicator(),
+    }
+}
+
+/// Create a chart transformer and its window, for candles or candles with an
+/// indicator. `indicator` names the indicator panel (e.g. `"RSI"`); it is
+/// shown only if the items carry an indicator value.
 pub fn chart<I: ChartData>(
     title: impl Into<String>,
     indicator: impl Into<String>,
+) -> (Chart<I>, ChartWindow) {
+    chart_with(title, &[], indicator, frame_of::<I>)
+}
+
+/// Create a chart transformer and its window for any item: `frame` tells what
+/// to draw for each item; `overlays` names the curves drawn over the price
+/// (e.g. `["EMA 9", "EMA 21"]`), in the order of [`ChartFrame::overlays`].
+pub fn chart_with<I>(
+    title: impl Into<String>,
+    overlays: &[&str],
+    indicator: impl Into<String>,
+    frame: for<'a> fn(&'a I) -> ChartFrame<'a>,
 ) -> (Chart<I>, ChartWindow) {
     let (tx, rx) = mpsc::channel();
     let title = title.into();
@@ -237,12 +307,13 @@ pub fn chart<I: ChartData>(
         Chart {
             tx,
             title: title.clone(),
-            input: PhantomData,
+            frame,
         },
         ChartWindow {
             rx,
             title,
             indicator: indicator.into(),
+            overlays: overlays.iter().map(|s| (*s).to_string()).collect(),
         },
     )
 }
@@ -252,10 +323,10 @@ pub fn chart<I: ChartData>(
 pub struct Chart<I> {
     tx: mpsc::Sender<Msg>,
     title: String,
-    input: PhantomData<fn(I)>,
+    frame: for<'a> fn(&'a I) -> ChartFrame<'a>,
 }
 
-impl<I: ChartData> Transformer for Chart<I> {
+impl<I: SourceData> Transformer for Chart<I> {
     type Input = I;
     type Value = ();
     type Modifier = ChartModifier;
@@ -269,8 +340,8 @@ impl<I: ChartData> Transformer for Chart<I> {
     }
 
     fn on_data(&mut self, item: Item<'_, I>) -> Option<()> {
-        let item = item.data;
-        let c = item.candle();
+        let frame = (self.frame)(item.data);
+        let c = frame.candle;
         // If the window was closed, keep forwarding data anyway.
         let _ = self.tx.send(Msg::Candle {
             x: x(c.open_time),
@@ -278,7 +349,8 @@ impl<I: ChartData> Transformer for Chart<I> {
             high: f(c.high),
             low: f(c.low),
             close: f(c.close),
-            indicator: item.indicator().map(f),
+            overlays: frame.overlays.iter().map(|v| v.map(f)).collect(),
+            indicator: frame.indicator.map(f),
         });
         Some(())
     }
@@ -292,6 +364,16 @@ impl<I: ChartData> Transformer for Chart<I> {
                     kind: m.kind,
                     label: m.label,
                 });
+                Ok(())
+            }
+            ChartModifier::Segment(sg) => {
+                let _ = self.tx.send(Msg::Segment(SegmentPoint {
+                    panel: sg.panel,
+                    from: [x(sg.from.0), f(sg.from.1)],
+                    to: [x(sg.to.0), f(sg.to.1)],
+                    kind: sg.kind,
+                    label: sg.label,
+                }));
                 Ok(())
             }
         }
@@ -308,6 +390,7 @@ pub struct ChartWindow {
     rx: mpsc::Receiver<Msg>,
     title: String,
     indicator: String,
+    overlays: Vec<String>,
 }
 
 impl ChartWindow {
@@ -326,6 +409,7 @@ impl ChartWindow {
                     window: self,
                     candles: Vec::new(),
                     markers: Vec::new(),
+                    segments: Vec::new(),
                     step: None,
                     fit_price: true,
                     pending: None,
@@ -342,6 +426,7 @@ struct CandlePoint {
     high: f64,
     low: f64,
     close: f64,
+    overlays: Vec<Option<f64>>,
     indicator: Option<f64>,
 }
 
@@ -370,11 +455,41 @@ struct App {
     window: ChartWindow,
     candles: Vec<CandlePoint>,
     markers: Vec<MarkerPoint>,
+    segments: Vec<SegmentPoint>,
     /// Smallest time step between candles (seconds), for the candle width.
     step: Option<f64>,
     /// Fit the price axis to the visible candles.
     fit_price: bool,
     pending: Option<ViewCmd>,
+}
+
+/// Colours of the curves drawn over the price.
+const OVERLAY_COLORS: [Color32; 4] = [
+    Color32::from_rgb(255, 200, 60),
+    Color32::from_rgb(190, 120, 255),
+    Color32::from_rgb(90, 220, 220),
+    Color32::from_rgb(255, 140, 60),
+];
+
+/// Draw the segments of `panel`, with a label at their end.
+fn draw_segments(plot: &mut egui_plot::PlotUi<'_>, segments: &[SegmentPoint], panel: ChartPanel) {
+    for sg in segments.iter().filter(|s| s.panel == panel) {
+        let color = sg.kind.style().color;
+        plot.line(
+            Line::new("", PlotPoints::new(vec![sg.from, sg.to]))
+                .stroke(Stroke::new(2.0, color))
+                .allow_hover(false),
+        );
+        plot.text(
+            Text::new(
+                "",
+                PlotPoint::new(sg.to[0], sg.to[1]),
+                format!("  {}", sg.label),
+            )
+            .color(color)
+            .anchor(egui::Align2::LEFT_BOTTOM),
+        );
+    }
 }
 
 fn time_label(secs: f64) -> String {
@@ -424,6 +539,10 @@ fn visible_price_range(
     for c in candles.iter().filter(|c| visible(c.x)) {
         lo = lo.min(c.low);
         hi = hi.max(c.high);
+        for v in c.overlays.iter().flatten() {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
     }
     for m in markers.iter().filter(|m| visible(m.x)) {
         lo = lo.min(m.price);
@@ -445,6 +564,7 @@ impl App {
                     high,
                     low,
                     close,
+                    overlays,
                     indicator,
                 } => {
                     if let Some(prev) = self.candles.last() {
@@ -459,6 +579,7 @@ impl App {
                         high,
                         low,
                         close,
+                        overlays,
                         indicator,
                     });
                 }
@@ -473,6 +594,7 @@ impl App {
                     kind,
                     label,
                 }),
+                Msg::Segment(sg) => self.segments.push(sg),
             }
         }
     }
@@ -549,6 +671,19 @@ impl App {
                 }
 
                 plot.box_plot(BoxPlot::new("candles", boxes).allow_hover(false));
+                for (i, name) in self.window.overlays.iter().enumerate() {
+                    let points: Vec<[f64; 2]> = self
+                        .candles
+                        .iter()
+                        .filter_map(|c| c.overlays.get(i).copied().flatten().map(|v| [c.x, v]))
+                        .collect();
+                    plot.line(
+                        Line::new(name.clone(), PlotPoints::new(points))
+                            .color(OVERLAY_COLORS[i % OVERLAY_COLORS.len()])
+                            .stroke(Stroke::new(1.5, OVERLAY_COLORS[i % OVERLAY_COLORS.len()])),
+                    );
+                }
+                draw_segments(plot, &self.segments, ChartPanel::Price);
                 for kind in MarkerKind::DRAW_ORDER {
                     let style = kind.style();
                     let points: Vec<[f64; 2]> = self
@@ -608,6 +743,7 @@ impl App {
                     Line::new(self.window.indicator.clone(), PlotPoints::new(points))
                         .color(Color32::from_rgb(120, 140, 255)),
                 );
+                draw_segments(plot, &self.segments, ChartPanel::Indicator);
             });
     }
 }
@@ -698,7 +834,7 @@ mod tests {
                 assert_eq!(high, 101.0);
                 assert_eq!(indicator, Some(42.0));
             }
-            Msg::Marker { .. } => panic!("expected a candle"),
+            _ => panic!("expected a candle"),
         }
         match window.rx.try_recv().unwrap() {
             Msg::Marker {
@@ -708,7 +844,7 @@ mod tests {
                 assert_eq!(price, 100.0);
                 assert_eq!(label, "long");
             }
-            Msg::Candle { .. } => panic!("expected a marker"),
+            _ => panic!("expected a marker"),
         }
     }
 
@@ -726,6 +862,7 @@ mod tests {
             high,
             low,
             close: high,
+            overlays: Vec::new(),
             indicator: None,
         }
     }
@@ -806,5 +943,66 @@ mod tests {
         assert!(!close.filled && close.radius < buy.radius);
         // Labels: opens on the right, exits on the left (no overlap on a flip).
         assert!(buy.label_right && !close.label_right);
+    }
+
+    /// A candle with two EMAs and an RSI.
+    type Full = Derived<Candle, (Option<Decimal>, Option<Decimal>, Option<Decimal>)>;
+
+    fn full_frame(d: &Full) -> ChartFrame<'_> {
+        let (a, b, rsi) = d.value.unwrap_or((None, None, None));
+        ChartFrame {
+            candle: &d.data,
+            overlays: vec![a, b],
+            indicator: rsi,
+        }
+    }
+
+    #[test]
+    fn chart_with_sends_overlays_indicator_and_segments() {
+        let (mut chart, window) = chart_with::<Full>("t", &["EMA 9", "EMA 21"], "RSI", full_frame);
+        assert_eq!(window.overlays, ["EMA 9", "EMA 21"]);
+        let item = Derived {
+            data: candle(1, dec!(100)),
+            value: Some((Some(dec!(99)), None, Some(dec!(55)))),
+        };
+        chart.on_data(replay(&item));
+        chart
+            .on_modifier(ChartModifier::Segment(Segment {
+                panel: ChartPanel::Indicator,
+                from: (item.data.open_time, dec!(30)),
+                to: (item.data.open_time + TimeDelta::minutes(5), dec!(35)),
+                kind: MarkerKind::Bullish,
+                label: "div".into(),
+            }))
+            .unwrap();
+        match window.rx.try_recv().unwrap() {
+            Msg::Candle {
+                overlays,
+                indicator,
+                ..
+            } => {
+                assert_eq!(overlays, vec![Some(99.0), None]);
+                assert_eq!(indicator, Some(55.0));
+            }
+            _ => panic!("expected a candle"),
+        }
+        match window.rx.try_recv().unwrap() {
+            Msg::Segment(sg) => {
+                assert_eq!(sg.panel, ChartPanel::Indicator);
+                assert_eq!(sg.from[1], 30.0);
+                assert_eq!(sg.to, [60.0 + 300.0, 35.0]);
+            }
+            _ => panic!("expected a segment"),
+        }
+    }
+
+    #[test]
+    fn price_range_includes_the_curves() {
+        // Candle 90..110 with a curve at 160: the range includes it.
+        let mut with_curve = point(0.0, 90.0, 110.0);
+        with_curve.overlays = vec![Some(160.0), None];
+        let candles = [with_curve];
+        let (lo, hi) = visible_price_range(&candles, &[], 0.0, 1.0).unwrap();
+        assert!(lo < 90.0 && hi > 160.0);
     }
 }

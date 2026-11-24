@@ -568,9 +568,9 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 **Why:** To understand a strategy, one needs to see the candles, the indicator and the trades together.
 
 **Behavior** (cargo feature `chart`, crates `eframe` + `egui_plot`):
-- `chart(title, indicator_name)` creates a `Chart` transformer and a `ChartWindow`.
+- `chart(title, indicator_name)` creates a `Chart` transformer and a `ChartWindow` for candles or candles with an indicator; `chart_with(title, curve_names, indicator_name, frame)` for any item: `frame` gives, for each item, the candle, the **curves drawn over the price** (e.g. EMAs) and the indicator value.
 - The transformer accepts candles, or candles with an indicator value (e.g. `RsiCandle`). Like every transformer it forwards every input item (value `()`), and sends each candle to the window.
-- It accepts the modifier `ChartModifier::Marker { time, price, kind, label }`, sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation (trades), and bullish / bearish signal (e.g. candlestick patterns). Signals are drawn first, trades on top.
+- It accepts the modifiers `ChartModifier::Marker { time, price, kind, label }` and `ChartModifier::Segment { panel, from, to, kind, label }` (a line between two points of the price or indicator panel, e.g. the pivots of a divergence), sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation (trades), and bullish / bearish signal (e.g. candlestick patterns). Signals are drawn first, trades on top.
 - The window shows the candles (green up / red down) with the markers, and the indicator in a second panel (with 30/70 lines), both on a shared time axis. It refreshes while data arrives.
 - Navigation: mouse wheel zooms the time axis around the cursor (both panels stay aligned); left-drag pans; right-drag zooms on a box; double-click resets. Toolbar: zoom in / out, *Fit all*, *Last 6h / 1d / 3d*, and *Auto-fit price* (on by default: the price axis fits the visible candles and markers; off: the price axis can be zoomed and dragged freely).
 - The window must run on the main thread; the executor runs in another thread. Closing the window does not stop data forwarding.

@@ -298,6 +298,20 @@ lists the patterns (several can match the same candle).
 cargo run --features chart --example chart_patterns -- [days] [timeframe]
 cargo run --features chart --example chart_patterns -- 2 15m
 ```
+
+**`chart_signals`** shows everything on one chart, on SOL/USDT history:
+- curves EMA 9 (yellow) and EMA 21 (purple) over the candles, RSI(14) in the
+  bottom panel;
+- EMA rules (price × EMA 9, EMA 9 × 21, pullback 9/21): big green ▲ buy / red
+  ▼ sell at the close, labelled with the rule;
+- RSI divergences: a segment between the two pivots on the price **and** on
+  the RSI (blue bullish, pink bearish);
+- candlestick patterns: small blue ▲ / pink ▼.
+
+```sh
+cargo run --features chart --example chart_signals -- [days] [timeframe]
+cargo run --features chart --example chart_signals -- 2 15m
+```
 - Navigation:
   - mouse wheel: zoom the time axis;
   - left-drag: pan;
