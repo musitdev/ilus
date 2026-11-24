@@ -290,6 +290,9 @@ cargo run --features chart --example chart_futures -- --from 2026-09-22 --to 202
 
 - Markers: green ▲ long, red ▼ short, grey ○ close, orange ✕ stop-loss,
   purple ✱ liquidation.
+- Divergences: a segment between the two pivots on the price and on the RSI
+  (blue bullish, pink bearish); the trade they open is at the end of the
+  segments.
 
 **`chart_patterns`** shows the candlestick patterns detected on SOL/USDT
 history, to inspect them: a blue ▲ under the low for bullish patterns, a pink ▼

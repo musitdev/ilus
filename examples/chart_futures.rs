@@ -1,13 +1,19 @@
-//! Futures simulation with a chart window: candles, RSI and every trade.
+//! Futures simulation with a chart window: candles, RSI, the divergences and
+//! every trade.
 //!
 //! ```text
-//!                         ┌──> Chart <───────── ChartModifier::Marker (trades) ─┐
-//! BinanceSource ──> Rsi(14) ──> WithTicks(RsiDivergence) ──> Futures ───────────┘
+//!                         ┌──> Chart <──────────── markers (trades), segments (divergences) ─┐
+//! BinanceSource ──> Rsi(14) ──> WithTicks(RsiDivergence) ─┬─> Futures ───────────────────────┤
+//!                                                         └─> MarkDivergence ────────────────┘
 //! ```
 //!
 //! Same options and rules as `backtest_futures` (one fee: the first one given).
-//! Markers: green ▲ long, red ▼ short, grey ● close, orange ✕ stop-loss,
-//! purple ✱ liquidation. The RSI is shown in the bottom panel (30 / 70 lines).
+//! - Markers: green ▲ long, red ▼ short, grey ● close, orange ✕ stop-loss,
+//!   purple ✱ liquidation.
+//! - Divergences: a segment between the two pivots on the price **and** on
+//!   the RSI (they go in opposite directions); blue = bullish, pink = bearish.
+//!   The trade opened by a divergence is at the end of its segments.
+//! - The RSI is shown in the bottom panel (30 / 70 lines).
 //!
 //! The window must run on the main thread: the executor runs in a background thread.
 //! Close the window to quit.
@@ -18,15 +24,20 @@
 #[path = "support/futures.rs"]
 mod futures;
 
-use futures::{Futures, Side, Trade, TradeKind, TradeRecorder, WithTicks, fmt_time, parse_args};
-use ilus::action::ActionContext;
-use ilus::condition::divergence::RsiDivergence;
+use futures::{
+    Futures, Side, Signal as TickSignal, Trade, TradeKind, TradeRecorder, WithTicks, fmt_time,
+    parse_args,
+};
+use ilus::action::{Action, ActionContext};
+use ilus::condition::divergence::{DivergenceKind, RsiDivergence};
+use ilus::error::ActionError;
 use ilus::executor::Executor;
 use ilus::graph::Graph;
 use ilus::modifier::ModifierHandle;
 use ilus::source::binance::BinanceSource;
-use ilus::transformer::chart::{ChartModifier, Marker, MarkerKind, chart};
+use ilus::transformer::chart::{ChartModifier, ChartPanel, Marker, MarkerKind, Segment, chart};
 use ilus::transformer::rsi::{Rsi, RsiCandle};
+use ilus::trigger::TriggerEvent;
 use rust_decimal::Decimal;
 
 /// Sends every trade of the simulation to the chart, as a modifier.
@@ -53,13 +64,52 @@ impl TradeRecorder for ChartRecorder {
     }
 }
 
+/// Draws each divergence: a segment between its two pivots on the price and
+/// on the RSI. Ignores the per-candle ticks.
+struct MarkDivergence(ModifierHandle<ChartModifier>);
+
+impl Action for MarkDivergence {
+    type Value = TickSignal;
+    type Input = RsiCandle;
+
+    fn run(
+        &mut self,
+        event: TriggerEvent<'_, TickSignal, RsiCandle>,
+        ctx: &mut ActionContext,
+    ) -> Result<(), ActionError> {
+        let TickSignal::Divergence(d) = event.value else {
+            return Ok(());
+        };
+        let (kind, label) = match d.kind {
+            DivergenceKind::Bullish => (MarkerKind::Bullish, "bull div"),
+            DivergenceKind::Bearish => (MarkerKind::Bearish, "bear div"),
+        };
+        for (panel, from, to) in [
+            (ChartPanel::Price, d.first.price, d.second.price),
+            (ChartPanel::Indicator, d.first.rsi, d.second.rsi),
+        ] {
+            ctx.send(
+                &self.0,
+                ChartModifier::Segment(Segment {
+                    panel,
+                    from: (d.first.time, from),
+                    to: (d.second.time, to),
+                    kind,
+                    label: label.into(),
+                }),
+            );
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     let fee = args.fees.first().copied().unwrap_or_default();
     println!("{}", args.header);
 
     let title = format!(
-        "SOL/USDT {} {} → {} | {}x, stop {}, right {}, fee {}%",
+        "SOL/USDT {} {} → {} | {}x, stop {}, right {}, RSI {}/{}, lookahead {}, fee {}%",
         args.timeframe,
         fmt_time(args.from),
         fmt_time(args.to),
@@ -67,6 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.stop
             .map_or("none".to_string(), |p| format!("{}%", p.normalize())),
         args.params.right,
+        args.params.rsi_low,
+        args.params.rsi_high,
+        args.params.lookahead,
         fee.normalize()
     );
     let (chart_transformer, window) = chart::<RsiCandle>(title, "RSI(14)");
@@ -92,6 +145,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         &signals,
     );
+    // A second action on the same condition draws the divergences.
+    g.action(MarkDivergence(markers), &signals);
 
     // The executor runs on its own thread; the window owns the main thread.
     let executor = Executor::new(g).with_tick(args.tick);
