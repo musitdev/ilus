@@ -447,6 +447,11 @@ In code: `PatternCondition::new(ThresholdSet::default())`; a single value can be
 - The transformed source inherits the asset and timeframe of its input.
 - Its output can feed any number of consumers (fan-out); it is computed once per item. Its items keep the running mode of the input (§5.3).
 
+**EMA transformer** (Exponential Moving Average):
+- Input: candles. Output: `EmaCandle = Derived<Candle, Decimal>`: each candle with the EMA of the closes, `None` during warm-up.
+- Parameter: `period` (≥ 1). `EMA = previous EMA + k × (close − previous EMA)`, with `k = 2 / (period + 1)`. The first value is the plain mean of the first `period` closes. Warm-up: `period` candles.
+- The same calculation (`EmaCalc`) is used by the prior trend of the candlestick patterns (F0).
+
 **Aggregation transformer** (e.g. 1m → 5m):
 - Builds candles of a longer timeframe from the input candles, on boundaries aligned to the clock (00:00, 00:05, …): open of the first candle, highest high, lowest low, close of the last one, sum of volumes.
 - It emits on **each input candle**: `Derived { data: 1m candle, value: Option<5m candle> }`, where the value is the **last completed** 5m candle, sent again until the next one completes (`None` before the first one). A 5m candle is completed by the 1m candle that closes its period; the 5m candle still forming is never sent (closed data only).

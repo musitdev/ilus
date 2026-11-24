@@ -20,6 +20,7 @@ use crate::condition::Condition;
 use crate::error::{ModifierError, ParameterError};
 use crate::modifier::ModifierValue;
 use crate::source::Item;
+use crate::transformer::ema::EmaCalc;
 use crate::trigger::{Detection, TriggerEventType, TriggerValue};
 
 /// Thresholds of the pattern definitions (spec F0). Fields are public, so a
@@ -266,9 +267,8 @@ pub struct PatternCondition {
     signal: Option<Signal>,
     /// Last candles (enough for the averages and the 3-candle patterns).
     bars: VecDeque<Bar>,
-    /// EMA of the closes, and the closes seen before it is seeded.
-    ema: Option<Decimal>,
-    seed: Vec<Decimal>,
+    /// EMA of the closes (prior trend).
+    ema: EmaCalc,
 }
 
 impl PatternCondition {
@@ -277,11 +277,10 @@ impl PatternCondition {
         thresholds.validate()?;
         Ok(Self {
             bars: VecDeque::with_capacity(thresholds.avg_len + 4),
+            ema: EmaCalc::new(thresholds.trend_len)?,
             t: thresholds,
             watched: Pattern::ALL.to_vec(),
             signal: None,
-            ema: None,
-            seed: Vec::new(),
         })
     }
 
@@ -296,22 +295,8 @@ impl PatternCondition {
 
     /// Update the EMA with `close`; returns the trend of this candle.
     fn update_trend(&mut self, close: Decimal, cmp: Cmp) -> Option<Trend> {
-        let n = self.t.trend_len;
-        let ema = match self.ema {
-            Some(prev) => {
-                let k = dec!(2) / Decimal::from(n + 1);
-                prev + k * (close - prev)
-            }
-            None => {
-                self.seed.push(close);
-                if self.seed.len() < n {
-                    return None;
-                }
-                // Seeded with the mean of the first `trend_len` closes.
-                self.seed.iter().sum::<Decimal>() / Decimal::from(n)
-            }
-        };
-        self.ema = Some(ema);
+        // Seeded with the mean of the first `trend_len` closes.
+        let ema = self.ema.update(close)?;
         Some(if cmp.lt(close, ema) {
             Trend::Down
         } else if cmp.gt(close, ema) {
@@ -486,11 +471,10 @@ impl Default for PatternCondition {
         let t = ThresholdSet::default();
         Self {
             bars: VecDeque::with_capacity(t.avg_len + 4),
+            ema: EmaCalc::clamped(t.trend_len),
             t,
             watched: Pattern::ALL.to_vec(),
             signal: None,
-            ema: None,
-            seed: Vec::new(),
         }
     }
 }

@@ -99,6 +99,8 @@ Key properties:
 - **Transformers**
   - `Rsi`: RSI (Wilder smoothing, default period 14). Output: `RsiCandle`
     (candle + RSI).
+  - `Ema`: exponential moving average of the closes (seeded with the mean of
+    the first `period` closes). Output: `EmaCandle` (candle + EMA).
   - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
     complete periods are sent.
   - `Combine`: runs 2 or 3 transformers on the same input as one node.
@@ -308,6 +310,7 @@ src/
   candle.rs           Candle (OHLCV)
   transformer.rs      Transformer trait, Derived
   transformer/rsi.rs  RSI transformer
+  transformer/ema.rs  EMA transformer
   transformer/aggregate.rs  aggregation (1m -> 5m, ...)
   transformer/combine.rs    combined transformer and adapters
   transformer/chart.rs chart transformer + window (feature `chart`)
