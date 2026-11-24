@@ -397,6 +397,9 @@ examples/             runnable examples (see above)
 tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
 tests/trend_filter.rs trend filter in a graph
 tests/agent.rs        votes triggering the decision in the same tick
+tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
+                      against an independent computation
+tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
 ```
 
 ---

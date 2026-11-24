@@ -160,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn the_closing_candle_counts_for_high_low_and_close() {
+        // The last 1m candle of the period holds the high, the low and the close.
+        let mut a = Aggregate::new(Timeframe::M1, Timeframe::M5).unwrap();
+        let mut last = None;
+        for m in 0..4 {
+            last = feed(&mut a, &candle(m, 10, 11, 9, 10));
+        }
+        assert!(last.is_none());
+        let done = feed(&mut a, &candle(4, 10, 20, 5, 7)).unwrap();
+        assert_eq!(
+            (done.open, done.high, done.low, done.close),
+            (dec!(10), dec!(20), dec!(5), dec!(7))
+        );
+    }
+
+    #[test]
     fn incomplete_periods_are_never_sent() {
         let mut a = Aggregate::new(Timeframe::M1, Timeframe::M5).unwrap();
         // Starts in the middle of a period: 00:00-00:05 is incomplete.
