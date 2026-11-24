@@ -37,6 +37,9 @@
 //!   long closes at the first high pivot after entry with RSI above R, a short
 //!   at the first low pivot with RSI below R, at the close of the candle that
 //!   confirms the pivot; the account then stays flat until the next divergence;
+//! - trend filter (`--trend N`, rule 3): divergences open a position only in
+//!   the direction of the trend (long above the EMA N of the closes, short
+//!   below); the RSI exits and stops are not filtered;
 //! - funding rates are ignored.
 //!
 //! The condition is wrapped so that it also emits a "tick" event for every
@@ -53,11 +56,20 @@
 mod futures;
 
 use futures::{Futures, WithTicks, parse_args};
+use ilus::condition::filter::TrendFilter;
 use ilus::executor::Executor;
 use ilus::graph::Graph;
 use ilus::source::binance::BinanceSource;
 use ilus::transformer::rsi::Rsi;
+use ilus::transformer::trend::Trend;
 use rust_decimal::Decimal;
+
+/// One simulated account per fee, on any input containing the candle.
+fn account<I>(args: &futures::Args, fee: Decimal) -> Futures<(), I> {
+    Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ())
+        .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1)
+        .with_flip_on_divergence(args.flip_on_divergence)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
@@ -66,14 +78,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     let sol = g.source(BinanceSource::new("SOLUSDT", args.timeframe).replay(args.from, args.to));
     let sol_rsi = g.transform(Rsi::new(14)?, &sol);
-    let signals = g.condition("sol-divergence", WithTicks::new(args.params)?, &sol_rsi);
-    for &fee in &args.fees {
-        g.action(
-            Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ())
-                .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1)
-                .with_flip_on_divergence(args.flip_on_divergence),
-            &signals,
-        );
+    match args.trend {
+        // Rule 3: Rsi ──> Trend(EMA n) ──> TrendFilter(WithTicks) ──> Futures.
+        Some(n) => {
+            let sol_trend = g.transform(Trend::new(n)?, &sol_rsi);
+            let rule = TrendFilter::new(WithTicks::new(args.params)?);
+            let signals = g.condition("sol-divergence", rule, &sol_trend);
+            for &fee in &args.fees {
+                g.action(account(&args, fee), &signals);
+            }
+        }
+        None => {
+            let signals = g.condition("sol-divergence", WithTicks::new(args.params)?, &sol_rsi);
+            for &fee in &args.fees {
+                g.action(account(&args, fee), &signals);
+            }
+        }
     }
     Executor::new(g).with_tick(args.tick).run()?;
     Ok(())

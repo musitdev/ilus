@@ -276,6 +276,7 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `--rsi-low R` / `--rsi-high R` | RSI level of the first low / high of a divergence (100 / 0: any level) | 30 / 70 |
 | `--lookahead N` | pivots after the first one in which the diverging one is searched | 3 |
 | `--flip-on-divergence` | an opposite divergence closes the position and opens the opposite one | off |
+| `--trend N` | trend filter (EMA rule 3): enter long only above the EMA N of the closes, short only below; exits not filtered (`backtest_futures` only) | none |
 | `--exit-rsi-high R` / `--exit-rsi-low R` | RSI exit: a long closes at the next high pivot with RSI above R, a short at the next low pivot with RSI below R (100 / 0: disabled) | 75 / 30 |
 | `--tick-ms N` | replay tick, in ms (0: as fast as possible) | 0 |
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |

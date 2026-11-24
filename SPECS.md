@@ -607,7 +607,10 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 - A cross triggers **once**, on the item where the side changes; touching (`a = b`) does not change the side; the first item only sets the side (no signal).
 - A ribbon triggers when the alignment **starts** (not while it lasts, not if already aligned on the first item).
 - A pullback requires the previous close on the trend side of the short EMA, which excludes breakouts.
-- Rule 3 (trend filter: only buys above a long EMA) is not a signal but a filter on other signals: not implemented yet.
+- Rule 3 (trend filter) is not a signal but a filter on other signals, in two parts:
+  - **`Trend(EMA n)` transformer** (data): adds to each item the EMA of the closes and the trend side, **up** when the close is above the EMA, **down** when below, none when equal or warming up. It works on any item containing a candle (candles, candles + RSI, ...).
+  - **`TrendFilter(condition)` condition** (decision): wraps any condition (divergence, patterns, EMA rules); the wrapped condition sees every item, and its signals pass only in the trend direction: buys in an uptrend, sells in a downtrend, nothing when the trend is flat or unknown. Candlestick patterns are filtered one by one (a candle can carry both directions; the event type becomes the first pattern kept). `TrendFilter::disabled` lets everything pass (on/off gene). A detection triggered by a modifier passes only when the filter is disabled (no trend item then).
+  - Futures simulation: `--trend N`; only the **entries** (divergences) are filtered, the RSI exits and the stop-loss are not.
 
 **Price pivots** (`Pivots`, used by the divergence condition and by the futures simulation): a candle whose low (high) is strictly beyond the `left` candles before it and at least as far as the `right` candles after it, confirmed `right` candles later, with its RSI.
 

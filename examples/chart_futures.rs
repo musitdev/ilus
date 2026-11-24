@@ -138,6 +138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.params.lookahead,
         fee.normalize()
     );
+    if args.trend.is_some() {
+        return Err("--trend is only supported by backtest_futures".into());
+    }
     let (chart_transformer, window) = chart::<RsiCandle>(title, "RSI(14)");
 
     // Graph: the chart is a side branch of the RSI output (fan-out).

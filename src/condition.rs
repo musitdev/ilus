@@ -2,6 +2,7 @@
 
 pub mod divergence;
 pub mod ema_rules;
+pub mod filter;
 pub mod patterns;
 
 /// Direction of a signal.

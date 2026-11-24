@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use ilus::action::{Action, ActionContext};
-use ilus::candle::Candle;
-use ilus::condition::Condition;
+use ilus::candle::{Candle, CandleData};
 use ilus::condition::divergence::{
     ConfirmedPivots, Divergence, DivergenceKind, DivergenceParams, Pivots, RsiDivergence,
 };
+use ilus::condition::filter::SignalFilter;
+use ilus::condition::{Condition, Signal as Direction};
 use ilus::error::{ActionError, ModifierError};
 use ilus::modifier::NoModifier;
 use ilus::source::{Item, Timeframe};
@@ -34,6 +35,17 @@ pub struct Signal {
     pub pivots: ConfirmedPivots,
 }
 impl TriggerValue for Signal {}
+
+/// Trend filter (`--trend N`): only the divergence (the entry) is filtered;
+/// the pivots (the RSI exits) always pass.
+impl SignalFilter for Signal {
+    fn retain(self, allowed: Option<Direction>) -> Option<Self> {
+        Some(Self {
+            divergence: self.divergence.and_then(|d| d.retain(allowed)),
+            pivots: self.pivots,
+        })
+    }
+}
 
 /// Wraps [`RsiDivergence`] and emits an event for every candle (the action
 /// needs every candle to check stops, liquidation and RSI exits).
@@ -142,8 +154,10 @@ impl Position {
 }
 
 /// Simulated futures account.
-pub struct Futures<R: TradeRecorder = ()> {
+pub struct Futures<R: TradeRecorder = (), I = RsiCandle> {
     recorder: R,
+    /// Input items: any item containing the candle (RSI candles, + trend).
+    input: std::marker::PhantomData<fn(I)>,
     /// Trades of the current event, given to the recorder after it.
     pending: Vec<Trade>,
     /// Open time of the candle being processed.
@@ -180,7 +194,7 @@ pub fn fmt_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M").to_string()
 }
 
-impl<R: TradeRecorder> Futures<R> {
+impl<R: TradeRecorder, I> Futures<R, I> {
     pub fn new(
         start_sol: Decimal,
         leverage: Decimal,
@@ -190,6 +204,7 @@ impl<R: TradeRecorder> Futures<R> {
     ) -> Self {
         Self {
             recorder,
+            input: std::marker::PhantomData,
             pending: Vec::new(),
             time: DateTime::<Utc>::UNIX_EPOCH,
             start_sol,
@@ -402,7 +417,7 @@ impl<R: TradeRecorder> Futures<R> {
     }
 }
 
-impl<R: TradeRecorder> Futures<R> {
+impl<R: TradeRecorder, I> Futures<R, I> {
     /// Process one candle (and its divergence, if any).
     fn step(&mut self, value: &Signal, c: &Candle) {
         self.time = c.open_time;
@@ -470,16 +485,16 @@ impl<R: TradeRecorder> Futures<R> {
     }
 }
 
-impl<R: TradeRecorder> Action for Futures<R> {
+impl<R: TradeRecorder, I: CandleData> Action for Futures<R, I> {
     type Value = Signal;
-    type Input = RsiCandle;
+    type Input = I;
 
     fn run(
         &mut self,
-        event: TriggerEvent<'_, Signal, RsiCandle>,
+        event: TriggerEvent<'_, Signal, I>,
         ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
-        self.step(event.value, &event.data.data);
+        self.step(event.value, event.data.candle());
         for trade in std::mem::take(&mut self.pending) {
             self.recorder.record(ctx, trade);
         }
@@ -488,7 +503,7 @@ impl<R: TradeRecorder> Action for Futures<R> {
 }
 
 /// Print the log and the summary when the stream ends.
-impl<R: TradeRecorder> Drop for Futures<R> {
+impl<R: TradeRecorder, I> Drop for Futures<R, I> {
     fn drop(&mut self) {
         let mut out = std::mem::take(&mut self.log);
         let now = self.mark(self.last_price);
@@ -547,12 +562,16 @@ pub struct Args {
     /// `--flip-on-divergence`: an opposite divergence closes the position and
     /// opens the opposite one (default: ignored while a position is open).
     pub flip_on_divergence: bool,
+    /// `--trend N`: only enter in the direction of the trend (close above /
+    /// below its EMA N); default none.
+    pub trend: Option<usize>,
     /// Description of the run.
     pub header: String,
 }
 
 /// Parse `[--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N]
-/// [--right N] [--min-gap N] [--rsi-low R] [--rsi-high R] [--lookahead N] [--tick-ms N]
+/// [--right N] [--min-gap N] [--rsi-low R] [--rsi-high R] [--lookahead N] [--exit-rsi-high R] [--exit-rsi-low R]
+/// [--flip-on-divergence] [--trend N] [--tick-ms N]
 /// [timeframe] [fees %...]`.
 pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -563,6 +582,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut tick = Duration::ZERO;
     let mut exit_rsi = (Decimal::from(75), Decimal::from(30));
     let mut flip_on_divergence = false;
+    let mut trend = None::<usize>;
     let mut stop: Option<Decimal> = None;
     // Pivot options; the gaps are given in candles and converted below.
     let (mut left, mut right) = (None::<usize>, None::<usize>);
@@ -577,6 +597,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         }
         let value = args.get(1).ok_or(format!("{flag} needs a value"))?.clone();
         match flag.as_str() {
+            "--trend" => trend = Some(value.parse().map_err(|e| format!("invalid --trend: {e}"))?),
             "--days" => days = value.parse().map_err(|e| format!("invalid --days: {e}"))?,
             "--tick-ms" => {
                 tick = Duration::from_millis(
@@ -687,7 +708,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         return Err("the start must be before the end".into());
     }
     let header = format!(
-        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, RSI exit {} / {}, {}, from {} to {} (UTC)\n",
+        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, RSI exit {} / {}, {}, trend {}, from {} to {} (UTC)\n",
         leverage.normalize(),
         stop.map_or("none".to_string(), |p| format!("{}%", p.normalize())),
         params.left,
@@ -703,6 +724,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         } else {
             "no flip"
         },
+        trend.map_or("none".to_string(), |n| format!("EMA {n}")),
         fmt_time(from),
         fmt_time(now)
     );
@@ -718,6 +740,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         tick,
         exit_rsi,
         flip_on_divergence,
+        trend,
         header,
     })
 }
