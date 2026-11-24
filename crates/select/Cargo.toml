@@ -8,3 +8,8 @@ license.workspace = true
 [dependencies]
 agent.workspace = true
 trading.workspace = true
+rust_decimal.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+rust_decimal_macros.workspace = true

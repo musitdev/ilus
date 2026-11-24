@@ -17,6 +17,7 @@
 //!   the gain in % is the fitness used by the selection.
 
 pub mod account;
+pub mod candles;
 pub mod decision;
 pub mod genome;
 pub mod simulate;

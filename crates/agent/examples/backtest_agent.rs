@@ -1,6 +1,6 @@
 //! Test agent (spec F9, F10) on SOL/USDT 15m history from Binance.
 //!
-//! 1. Fetch the candles once (a small graph: Binance replay -> collect).
+//! 1. Fetch the candles once ([`agent::candles::fetch_binance`]).
 //! 2. Simulate the agent with [`agent::simulate`]: five rules (15m and 1h
 //!    divergences, EMA cross, trend, candlestick patterns) vote, the
 //!    decision trades a simulated futures account.
@@ -14,84 +14,15 @@
 //! [--stop P] [--fee F] [--genome g1,g2,...] [--events]`
 //! (defaults: 60 days, 2x, stop 3 %, fee 0.05 %).
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use agent::Weights;
 use agent::account::{AccountParams, EventKind};
 use agent::decision::DecisionParams;
 use agent::genome::{AgentParams, DivergenceGenes, GENOME_LEN};
 use agent::simulate::{SimConfig, history_needed, simulate_params};
-use chrono::{DateTime, Days, Utc};
+use chrono::{Days, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use trading::action::{Action, ActionContext};
-use trading::candle::Candle;
-use trading::condition::Condition;
-use trading::error::{ActionError, ModifierError};
-use trading::executor::Executor;
-use trading::graph::Graph;
-use trading::modifier::NoModifier;
-use trading::source::binance::BinanceSource;
-use trading::source::{Item, Timeframe};
-use trading::trigger::{Detection, TriggerEvent, TriggerEventType, TriggerValue};
-
-/// Every candle (to collect them).
-struct Every;
-
-#[derive(Debug)]
-struct Tick;
-impl TriggerValue for Tick {}
-
-impl Condition for Every {
-    type Input = Candle;
-    type Value = Tick;
-    type Modifier = NoModifier;
-    fn warm_up(&self) -> usize {
-        0
-    }
-    fn on_data(&mut self, _: Item<'_, Candle>) -> Option<Detection<Tick>> {
-        Some(Detection {
-            event_type: TriggerEventType::Other("candle"),
-            value: Tick,
-        })
-    }
-    fn on_modifier(&mut self, m: NoModifier) -> Result<Option<Detection<Tick>>, ModifierError> {
-        match m {}
-    }
-}
-
-struct Collect(Arc<Mutex<Vec<Candle>>>);
-
-impl Action for Collect {
-    type Value = Tick;
-    type Input = Candle;
-    fn run(
-        &mut self,
-        event: TriggerEvent<'_, Tick, Candle>,
-        _: &mut ActionContext,
-    ) -> Result<(), ActionError> {
-        if let Ok(mut v) = self.0.lock() {
-            v.push(event.data.clone());
-        }
-        Ok(())
-    }
-}
-
-/// SOL/USDT 15m candles from `from` to `to` (excluded), from Binance.
-fn fetch(
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
-    let out = Arc::new(Mutex::new(Vec::new()));
-    let mut g = Graph::new();
-    let src = g.source(BinanceSource::new("SOLUSDT", Timeframe::M15).replay(from, to));
-    let c = g.condition("every", Every, &src);
-    g.action(Collect(out.clone()), &c);
-    Executor::new(g).with_tick(Duration::ZERO).run()?;
-    let v = out.lock().map_err(|_| "lock poisoned")?.clone();
-    Ok(v)
-}
+use trading::source::Timeframe;
 
 /// The hand-written test agent.
 fn hand_params() -> AgentParams {
@@ -167,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warm = history_needed(&params) as i64;
     let fetch_from = from - chrono::TimeDelta::minutes(15 * warm);
     let to = Utc::now();
-    let candles = fetch(fetch_from, to)?;
+    let candles = agent::candles::fetch_binance("SOLUSDT", Timeframe::M15, fetch_from, to)?;
 
     let cfg = SimConfig {
         from,

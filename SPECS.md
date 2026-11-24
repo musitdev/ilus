@@ -21,7 +21,7 @@ The **engine** (crate `trading`) is not a trading-strategy engine: it does not m
 |---|---|
 | `trading` | the engine: graph, executor, sources, transformers, conditions, actions, modifiers, chart (feature `chart`) |
 | `agent` | the multi-rule agent: voters, `SendVotes`, `Decision` (F9) |
-| `select` | the evolutionary search of agent genomes (not implemented yet) |
+| `select` | the evolutionary search of agent genomes (F11) |
 
 ## 2. Goals
 - Fetch market data through pluggable **sources**. A default source is provided: a free, public crypto price/volume feed with 1-minute precision.
@@ -713,6 +713,29 @@ Each call builds and runs its own executor: simulations can run in parallel thre
 - [ ] The account computes margin, fees, P&L, stop-loss fills and liquidation as specified.
 - [ ] On real candles, the equity recomputed from the events equals the account's, the events alternate open / close, and the gain is consistent with the final equity.
 - [ ] A simulation is deterministic; zero weights never trade; too little history or invalid settings are errors.
+
+### F11 — Evolution of agent genomes
+
+Crate `select`. `evolve(len, config, fitness)` runs a genetic algorithm on genomes of `len` genes in [0, 1]; `fitness` is any function (in practice `agent::simulate`, fitness = gain %). Deterministic: the random generator (SplitMix64) is seeded by `config.seed`.
+
+- **Generation 0**: `population` random genomes (uniform in [0, 1]).
+- **Evaluation**: each genome not evaluated before is evaluated, in parallel threads (one per genome); a known genome keeps its score (the simulation is deterministic on a fixed period). A fitness error stops the evolution with that error.
+- **Ranking** by fitness, best first.
+- **Next generation** (settings are parameters, to be tested):
+  - the `elite` best are kept unchanged;
+  - each other slot `k` (rank order) gets a child of the genome of that rank: with probability `crossover`, a uniform crossover with a tournament winner (`tournament` random picks, the best ranked wins); then each gene mutates with probability `mutation_rate`, by a Gaussian of strength `sigma` growing linearly with the rank, from `sigma_min` (best non-elite) to `sigma_max` (worst); genes are clamped to [0, 1].
+- **Stop**: after `generations`, or when the best fitness improved by less than `min_improvement` over the last `patience` generations (`patience` 0: never).
+- **Report**: generations run, stop reason, best fitness per generation, the last population with scores, the number of evaluations, and the **history of every genome of every generation** (generation, rank, origin random / elite / child, sigma, evaluated or known, score and details).
+
+Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 – 0.25, crossover 0.7, tournament 3, patience 10, min improvement 0.5, seed 1.
+
+**Example `evolve`**: SOL/USDT 15m, the last `--days` (30) days plus the longest warm-up any genome can need, fetched once from Binance (or `--candles file.csv`, saved with `--save`); prints the best and mean fitness of each generation and the final population (scores, parameters, `--genome` line for `backtest_agent`); writes the history to a CSV file (`--history`, one line per genome and generation, with the genes and the decoded parameters).
+
+**Acceptance criteria**
+- [ ] With elitism, the best fitness never decreases; on a simple test fitness it improves towards the optimum.
+- [ ] The history holds every genome of every generation with its rank and origin; elites are not evaluated again.
+- [ ] The mutation strength goes from `sigma_min` to `sigma_max` with the rank.
+- [ ] Same seed, same run; the early stop triggers on a flat fitness; invalid settings and fitness errors are errors.
 
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.

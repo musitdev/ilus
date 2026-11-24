@@ -148,6 +148,10 @@ Key properties:
   (25 genes in [0, 1] decoded into the agent's parameters): the agent runs on
   15m candles given in memory and trades a simulated futures account
   (`account::Account`); the result is the gain in %, with every trade event.
+- **Evolution** (crate `select`, `evolve`): genetic algorithm on genomes with
+  any fitness: elites kept, children by crossover and rank-dependent mutation
+  (little for the best, a lot for the worst), parallel evaluation, early
+  stop, deterministic seed, full history of every genome.
 - **Actions**
   - `Alert`: prints the trigger event. Works with any condition.
 
@@ -310,6 +314,19 @@ simulated futures account. Hand-written parameters, or any genome with
 cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g25] [--events]
 ```
 
+**`evolve`** (crate `select`): evolves agent genomes on the last month of
+SOL/USDT 15m (candles fetched once; `--candles` / `--save` to reuse a CSV);
+prints the best and mean gain per generation and the final population with
+`--genome` lines for `backtest_agent`; every evaluation goes to a history CSV
+(`--history`, default `evolve_history.csv`). All the algorithm settings are
+options (population, generations, elite, mutation rate, sigma min / max,
+crossover, tournament, patience, min improvement, seed), as are the account
+settings (leverage, stop, fee):
+
+```sh
+cargo run --release -p select --example evolve -- --days 30 --generations 50 --save month.csv
+```
+
 ### Chart window
 
 **`chart_futures`** runs the futures simulation and shows the result in a
@@ -407,6 +424,7 @@ crates/agent/              the multi-rule agent
   src/decision.rs       decision condition (weighted votes)
   src/voters.rs         one voter condition per rule
   src/account.rs        simulated futures account
+  src/candles.rs        candles: fetch from Binance once, CSV read / write
   src/genome.rs         genome (25 genes) <-> AgentParams
   src/simulate.rs       simulate: the fitness of a genome
   examples/backtest_agent.rs  test agent on the futures simulation
@@ -415,7 +433,10 @@ crates/agent/              the multi-rule agent
                         against an independent computation
   tests/simulate.rs     simulations on the same candles: accounting, determinism, errors
   tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
-crates/select/             evolutionary search of agent genomes (not implemented yet)
+crates/select/             evolutionary search of agent genomes
+  src/lib.rs            evolve: the genetic algorithm, history
+  src/rng.rs            deterministic random generator (SplitMix64)
+  examples/evolve.rs    evolution of agents on the last month of SOL/USDT 15m
 ```
 
 ---
