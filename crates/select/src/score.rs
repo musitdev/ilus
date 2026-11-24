@@ -1,9 +1,10 @@
 //! Scoring of a genome over several months (spec F11).
 //!
-//! - [`period_score`]: the score of one month from its gain and its number
-//!   of positions: `gain / positions^p` when the month gains (few trades
-//!   that gain are worth more), the gain itself when it loses (many losing
-//!   trades do not soften the loss), 0 without any trade.
+//! - [`period_score`]: the score of one month from its gain and its
+//!   activity (positions per day): `gain − penalty × (1 − activity)`, the
+//!   activity being 1 between `low` and `high` positions per day (the
+//!   target, e.g. 1 – 2), rising linearly from 0 below, decreasing as
+//!   `high / rate` above. No trade at all costs the full penalty.
 //! - [`balanced_folds`]: train / test splits of the months; built in pairs
 //!   (A/B, then B/A) so that each month is used as often for training as
 //!   for testing.
@@ -12,22 +13,57 @@
 //!   the training score and penalises the difference with the test months.
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::FromPrimitive;
 
 use crate::rng::Rng;
 
-/// Score of one month: `gain / positions^exponent` if `gain > 0`, `gain`
-/// if it is a loss, 0 without any position.
-pub fn period_score(gain: Decimal, positions: usize, exponent: f64) -> Decimal {
-    if positions == 0 {
-        return Decimal::ZERO;
+/// Target activity of the month score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Activity {
+    /// Lowest number of positions per day of the target band (> 0).
+    pub low: f64,
+    /// Highest number of positions per day of the target band (>= low).
+    pub high: f64,
+    /// Score lost by a month without any position (gain points).
+    pub penalty: Decimal,
+}
+
+impl Default for Activity {
+    /// 1 – 2 positions per day, penalty 20.
+    fn default() -> Self {
+        Self {
+            low: 1.0,
+            high: 2.0,
+            penalty: Decimal::from(20),
+        }
     }
-    if gain <= Decimal::ZERO {
-        return gain;
+}
+
+impl Activity {
+    /// Activity factor in [0, 1] of `rate` positions per day.
+    pub fn factor(&self, rate: f64) -> f64 {
+        if rate <= 0.0 || self.low <= 0.0 {
+            0.0
+        } else if rate < self.low {
+            rate / self.low
+        } else if rate <= self.high {
+            1.0
+        } else {
+            self.high / rate
+        }
     }
-    let divisor = (positions as f64).powf(exponent);
-    let score = gain.to_f64().unwrap_or(0.0) / divisor;
-    Decimal::from_f64(score).unwrap_or(gain)
+}
+
+/// Score of one month: `gain − penalty × (1 − activity)` with `positions`
+/// opened over `days` days.
+pub fn period_score(gain: Decimal, positions: usize, days: f64, target: &Activity) -> Decimal {
+    let rate = if days > 0.0 {
+        positions as f64 / days
+    } else {
+        0.0
+    };
+    let missing = Decimal::from_f64(1.0 - target.factor(rate)).unwrap_or(Decimal::ONE);
+    gain - target.penalty * missing
 }
 
 /// One split of the months: indices of the training and test months.
@@ -102,13 +138,22 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
-    fn few_winning_trades_score_more_and_losses_stay() {
-        assert_eq!(period_score(dec!(20), 4, 0.5), dec!(10));
-        assert_eq!(period_score(dec!(20), 4, 1.0), dec!(5));
-        assert_eq!(period_score(dec!(20), 4, 0.0), dec!(20));
-        assert!(period_score(dec!(20), 1, 0.5) > period_score(dec!(20), 16, 0.5));
-        assert_eq!(period_score(dec!(-12), 9, 0.5), dec!(-12));
-        assert_eq!(period_score(dec!(5), 0, 0.5), dec!(0));
+    fn one_or_two_trades_per_day_score_best() {
+        let t = Activity::default(); // 1 - 2 per day, penalty 20
+        // 30 days: 30 to 60 positions, no penalty.
+        assert_eq!(period_score(dec!(10), 30, 30.0, &t), dec!(10));
+        assert_eq!(period_score(dec!(10), 60, 30.0, &t), dec!(10));
+        // Half the target (15): half the penalty.
+        assert_eq!(period_score(dec!(10), 15, 30.0, &t), dec!(0));
+        // No trade: the full penalty.
+        assert_eq!(period_score(dec!(0), 0, 30.0, &t), dec!(-20));
+        // 4 per day (120): factor 0.5, penalty 10.
+        assert_eq!(period_score(dec!(10), 120, 30.0, &t), dec!(0));
+        // More trades towards the target increase the score.
+        let s = |n| period_score(dec!(5), n, 30.0, &t);
+        assert!(s(0) < s(5) && s(5) < s(20) && s(20) < s(30));
+        // Losses count in full.
+        assert_eq!(period_score(dec!(-12), 45, 30.0, &t), dec!(-12));
     }
 
     #[test]

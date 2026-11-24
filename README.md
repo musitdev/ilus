@@ -320,9 +320,10 @@ month; fitness: mean or worst gain with `--combine mean|min`; default: the
 last month), and measures the final population on test periods never used
 for selection (`--test FROM:TO`). Cross-validation mode: `--months 12
 --start 2025-11-01` simulates every month and scores the genome over 4
-train / test splits (`--folds`), the month score dividing a gain by
-positions^0.5 (`--trade-exponent`) and the fold score subtracting the
-train / test gap (`--gap-weight`); `--test` is then a holdout. The stop-loss
+train / test splits (`--folds`); the month score is the gain minus an
+activity penalty (none at 1 – 2 positions per day, `--trades-per-day`; the
+full `--activity-penalty` without any trade) and the fold score subtracts
+the train / test gap (`--gap-weight`); `--test` is then a holdout. The stop-loss
 is a gene. Candles are fetched once (`--candles` /
 `--save` to reuse a CSV);
 prints the best and mean gain per generation and the final population with

@@ -16,9 +16,9 @@
 //!    evaluation goes to `--history` (CSV, default `evolve_history.csv`).
 //!
 //! Cross-validation mode (spec F11): `--months 12 --start 2025-11-01
-//! [--folds 4] [--fold-seed 1] [--trade-exponent 0.5] [--gap-weight 1]`:
-//! every month is simulated; month score = gain / positions^p for a gain,
-//! the loss otherwise; fitness = mean over the folds (6 train / 6 test
+//! [--folds 4] [--fold-seed 1] [--trades-per-day 1:2] [--activity-penalty 20]
+//! [--gap-weight 1]`: every month is simulated; month score = gain −
+//! penalty × (1 − activity), activity 1 at 1 – 2 positions per day; fitness = mean over the folds (6 train / 6 test
 //! months each) of train - gap_weight x |train - test|; `--test` periods are
 //! then a holdout, never used for selection.
 //!
@@ -40,7 +40,7 @@ use agent::simulate::{SimConfig, SimResult, history_needed, simulate};
 use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use select::score::{Fold, balanced_folds, cross_score, fold_score, period_score};
+use select::score::{Activity, Fold, balanced_folds, cross_score, fold_score, period_score};
 use select::{EvolveConfig, Report, Score, evolve};
 use trading::candle::Candle;
 use trading::source::Timeframe;
@@ -108,7 +108,7 @@ fn positions(r: &SimResult) -> usize {
 struct Cross {
     months: Vec<Period>,
     folds: Vec<Fold>,
-    exponent: f64,
+    activity: Activity,
     gap_weight: Decimal,
 }
 
@@ -131,7 +131,11 @@ impl Cross {
             .collect::<Result<_, _>>()?;
         let scores: Vec<Decimal> = runs
             .iter()
-            .map(|r| period_score(r.gain_pct(), positions(r), self.exponent))
+            .zip(&self.months)
+            .map(|(r, p)| {
+                let days = (p.to - p.from).num_seconds() as f64 / 86_400.0;
+                period_score(r.gain_pct(), positions(r), days, &self.activity)
+            })
             .collect();
         let fitness = cross_score(&scores, &self.folds, self.gap_weight);
         Ok((runs, scores, fitness))
@@ -191,7 +195,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut combine = Combine::Mean;
     let (mut months, mut start_month) = (0usize, None::<DateTime<Utc>>);
     let (mut n_folds, mut fold_seed) = (4usize, 1u64);
-    let (mut exponent, mut gap_weight) = (0.5f64, dec!(1));
+    let mut activity = Activity::default();
+    let mut gap_weight = dec!(1);
     let (mut candles_file, mut save_file) = (None::<String>, None::<String>);
     let mut history_file = "evolve_history.csv".to_string();
     let mut account = AccountParams {
@@ -218,7 +223,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--start" => start_month = Some(parse_period(&format!("{v}:9999-01-01"))?.from),
             "--folds" => n_folds = v.parse()?,
             "--fold-seed" => fold_seed = v.parse()?,
-            "--trade-exponent" => exponent = v.parse()?,
+            "--trades-per-day" => {
+                let (lo, hi) = v.split_once(':').ok_or("--trades-per-day LOW:HIGH")?;
+                activity.low = lo.parse()?;
+                activity.high = hi.parse()?;
+                if !(activity.low > 0.0 && activity.high >= activity.low) {
+                    return Err("--trades-per-day: 0 < LOW <= HIGH".into());
+                }
+            }
+            "--activity-penalty" => activity.penalty = v.parse()?,
             "--gap-weight" => gap_weight = v.parse()?,
             "--candles" => candles_file = Some(v),
             "--save" => save_file = Some(v),
@@ -262,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Cross {
             months: ms,
             folds,
-            exponent,
+            activity,
             gap_weight,
         })
     } else {
@@ -341,10 +354,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(c) = &cross {
         println!(
-            "Cross-validation: {} months, {} folds, month score = gain / positions^{} (gains; losses as they are), fold score = train - {} x |train - test|",
+            "Cross-validation: {} months, {} folds, month score = gain - {} x (1 - activity), activity 1 at {}..{} positions/day, fold score = train - {} x |train - test|",
             c.months.len(),
             c.folds.len(),
-            c.exponent,
+            c.activity.penalty,
+            c.activity.low,
+            c.activity.high,
             c.gap_weight
         );
         for (k, f) in c.folds.iter().enumerate() {

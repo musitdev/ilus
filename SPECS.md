@@ -731,7 +731,7 @@ Crate `select`. `evolve(len, config, fitness)` runs a genetic algorithm on genom
 Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 – 0.25, crossover 0.7, tournament 3, patience 10, min improvement 0.5, seed 1.
 
 **Cross-validation score** (`select::score`, used by `evolve --months`):
-- **Month score**: `gain / positions^p` when the month gains (`p` = `--trade-exponent`, default 0.5: few trades that gain score more), the gain itself when it loses (many losing trades do not soften the loss), 0 without any position.
+- **Month score**: `gain − penalty × (1 − activity)`; the activity is 1 when the agent opens between `low` and `high` positions per day (`--trades-per-day 1:2`, the target), `rate / low` below (0 without any position: the full penalty), `high / rate` above; `penalty` = `--activity-penalty` (20 gain points). Gains and losses count in full; more trades towards the target increase the score.
 - **Folds**: `--folds` (4) splits of the `--months` (12) months into 6 train / 6 test months, built in pairs (A/B then B/A, two different shuffles, seeded by `--fold-seed`): each month is a training month in exactly half of the folds, and the training sets differ.
 - **Fold score**: `mean(train) − gap_weight × |mean(train) − mean(test)|` (`--gap-weight`, default 1): the difference between the training and test months is minimised.
 - **Fitness**: the mean of the fold scores. Every month is used by the fitness; `--test` periods are then a **holdout**, never used for selection.
