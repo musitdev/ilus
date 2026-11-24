@@ -753,6 +753,22 @@ Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 
 - [ ] The mutation strength goes from `sigma_min` to `sigma_max` with the rank.
 - [ ] Same seed, same run; the early stop triggers on a flat fitness; invalid settings and fitness errors are errors.
 
+### F12 — Training data per month
+
+The network is trained on months labelled by a good strategy **for that month**: fitting one month is the goal here, not a defect.
+
+- **Per month** (`select::month::evolve_month`): the agents (all the rules) are evolved on that month with the month score (F11); the best genome is kept, always (no filter).
+- **Margin over luck** (`select::month::best_random`): the best of N random traders (N = the genomes evaluated by the evolution, same month score) is recorded with the month: `margin = agent score − best random score`.
+- **Labels** (`agent::dataset::label`): each candle of the month gets the actions taken at its close, in order (`buy`: open long, `sell`: open short, `close_exit`, `close_stop`, `close_liquidation`; several joined with `+`, e.g. `close_stop+sell`) and the position after it (`long`, `short`, `flat`).
+- **Files** (example `export_months`, directory `--out`):
+  - `YYYY-MM.csv`: `open_time_ms,open,high,low,close,volume,action,position`, one line per 15m candle of the month;
+  - `YYYY-MM_events.csv`: `time_ms,action,side,price,equity`, the agent's trades;
+  - `months.csv`: per month the score, gain %, positions, stops, liquidations, lowest equity, best random score, margin, genomes evaluated, the 26 genes and the decoded parameters.
+
+**Acceptance criteria**
+- [ ] Each candle gets the actions at its time, in order, and the position after them; candles before the first trade are flat.
+- [ ] The CSV files have the documented columns.
+
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.
 - **CLI**: to be defined (at least: start the bot).

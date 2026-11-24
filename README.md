@@ -333,6 +333,16 @@ options (population, generations, elite, mutation rate, sigma min / max,
 crossover, tournament, patience, min improvement, seed), as are the account
 settings (leverage, fee):
 
+**`export_months`** (crate `select`): the training data of the network. Per
+month, the best agent evolved on that month; the month's candles labelled
+with its actions (`buy`, `sell`, `close_*`) and position, its trades, and a
+summary (`months.csv`: score, gain, margin over the best random trader,
+genome):
+
+```sh
+cargo run --release -p select --example export_months -- --candles year.csv --out dataset
+```
+
 **`compare_months`** (crate `select`): per month, the best of N random
 traders vs the best agent evolved with the 15m divergence only and with all
 the rules (same score, same number of tries):
@@ -447,6 +457,7 @@ crates/agent/              the multi-rule agent
   src/voters.rs         one voter condition per rule
   src/account.rs        simulated futures account
   src/candles.rs        candles: fetch from Binance once, CSV read / write
+  src/dataset.rs        candles labelled with an agent's trades (training data)
   src/genome.rs         genome (26 genes) <-> AgentParams
   src/simulate.rs       simulate: the fitness of a genome
   examples/backtest_agent.rs  test agent on the futures simulation
@@ -460,8 +471,10 @@ crates/select/             evolutionary search of agent genomes
   src/rng.rs            deterministic random generator (SplitMix64)
   src/score.rs          month score (activity), train / test folds, cross score
   src/baseline.rs       random trader (baseline)
+  src/month.rs          one month: best evolved agent, best random trader
   examples/evolve.rs    evolution of agents on SOL/USDT 15m (periods, cross-validation)
   examples/compare_months.rs  per month: random traders vs evolved agents
+  examples/export_months.rs   training data: labelled candles per month
 ```
 
 ---

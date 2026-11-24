@@ -19,6 +19,7 @@ use std::thread;
 use rust_decimal::Decimal;
 
 pub mod baseline;
+pub mod month;
 pub mod rng;
 pub mod score;
 

@@ -12,67 +12,15 @@
 //! [--months 12] [--start 2025-11-01] [--population 32] [--generations 30]
 //! [--leverage 2] [--fee 0.05]`
 
-use agent::account::{AccountParams, AccountSummary, EventKind};
+use agent::account::AccountParams;
 use agent::candles::from_csv;
-use agent::genome::GENOME_LEN;
-use agent::simulate::{SimConfig, simulate};
+use agent::simulate::SimConfig;
 use chrono::{DateTime, Months, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use select::baseline::RandomTrader;
-use select::rng::Rng;
-use select::score::{Activity, period_score};
-use select::{EvolveConfig, Score, evolve};
-use trading::candle::Candle;
-
-fn positions(a: &AccountSummary) -> usize {
-    a.events
-        .iter()
-        .filter(|e| matches!(e.kind, EventKind::Open(_)))
-        .count()
-}
-
-/// Best of an evolution: (score, gain %, positions, evaluations).
-fn best_evolved(
-    candles: &[Candle],
-    cfg: &SimConfig,
-    days: f64,
-    evolve_cfg: &EvolveConfig,
-    mask: Option<&[usize]>,
-) -> Result<(Decimal, Decimal, usize, usize), String> {
-    let activity = Activity::default();
-    let fit = |genome: &[f64]| -> Result<Score, String> {
-        let mut g = genome.to_vec();
-        for &i in mask.unwrap_or(&[]) {
-            g[i] = 0.0;
-        }
-        let r = simulate(&g, candles, cfg).map_err(|e| e.to_string())?;
-        let n = positions(&r.account);
-        Ok(Score {
-            fitness: period_score(r.gain_pct(), n, days, &activity),
-            details: vec![
-                ("gain".into(), r.gain_pct().to_string()),
-                ("positions".into(), n.to_string()),
-            ],
-        })
-    };
-    let report = evolve(GENOME_LEN, evolve_cfg, fit)?;
-    let best = report.population.first().ok_or("empty population")?;
-    let get = |k: &str| {
-        best.score
-            .details
-            .iter()
-            .find(|d| d.0 == k)
-            .map(|d| d.1.clone())
-            .unwrap_or_default()
-    };
-    Ok((
-        best.score.fitness,
-        get("gain").parse().unwrap_or_default(),
-        get("positions").parse().unwrap_or_default(),
-        report.evaluations,
-    ))
-}
+use select::EvolveConfig;
+use select::month::{best_random, evolve_month, positions};
+use select::score::Activity;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut candles_file = None::<String>;
@@ -131,8 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for k in 0..months {
         let from = start.checked_add_months(Months::new(k)).ok_or("date")?;
         let to = from.checked_add_months(Months::new(1)).ok_or("date")?;
-        let days = (to - from).num_seconds() as f64 / 86_400.0;
-        let month: Vec<&Candle> = candles
+        let month: Vec<_> = candles
             .iter()
             .filter(|c| c.open_time >= from && c.open_time < to)
             .collect();
@@ -146,51 +93,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed: u64::from(k) + 1,
             ..evolve_cfg
         };
-
-        let all = best_evolved(&candles, &cfg, days, &ecfg, None)?;
-        let div = best_evolved(&candles, &cfg, days, &ecfg, Some(&div_only))?;
-
-        // N random traders, N = the evaluations of the "all rules" evolution.
-        let mut rng = Rng::new(1000 + u64::from(k));
-        let (mut best, mut gains) = ((Decimal::MIN, Decimal::ZERO, 0usize), Decimal::ZERO);
-        for i in 0..all.3 {
-            let stop = dec!(1) + Decimal::from(rng.below(19)) * dec!(0.5); // 1 - 10 %
-            let trader = RandomTrader {
-                p_open: 1.0 / 32.0,
-                p_close: 1.0 / 32.0,
-                account: AccountParams {
-                    stop_pct: Some(stop),
-                    ..account
-                },
-            };
-            let a = trader.run(&candles, from, to, i as u64 + 1)?;
-            let n = positions(&a);
-            let s = period_score(a.gain_pct, n, days, &activity);
-            gains += a.gain_pct;
-            if s > best.0 {
-                best = (s, a.gain_pct, n);
-            }
-        }
-        let mean = gains / Decimal::from(all.3.max(1) as u64);
+        let all = evolve_month(&candles, &cfg, &ecfg, &activity, &[])?;
+        let div = evolve_month(&candles, &cfg, &ecfg, &activity, &div_only)?;
+        let (rand, mean) = best_random(
+            &candles,
+            from,
+            to,
+            account,
+            &activity,
+            all.evaluations,
+            1000 + u64::from(k),
+        )?;
         println!(
             "{:<8} {:>6}% | {:>8} {:>+7}% ({:>2}) {:>+6}% | {:>8} {:>+7}% ({:>2}) | {:>8} {:>+7}% ({:>2})",
             from.format("%Y-%m"),
             sol.round_dp(1),
-            best.0.round_dp(1),
-            best.1.round_dp(1),
-            best.2,
+            rand.0.round_dp(1),
+            rand.1.round_dp(1),
+            rand.2,
             mean.round_dp(1),
-            div.0.round_dp(1),
-            div.1.round_dp(1),
-            div.2,
-            all.0.round_dp(1),
-            all.1.round_dp(1),
-            all.2
+            div.score.round_dp(1),
+            div.result.gain_pct().round_dp(1),
+            positions(&div.result.account),
+            all.score.round_dp(1),
+            all.result.gain_pct().round_dp(1),
+            positions(&all.result.account)
         );
-        sums[0] += best.0;
+        sums[0] += rand.0;
         sums[1] += mean;
-        sums[2] += div.0;
-        sums[3] += all.0;
+        sums[2] += div.score;
+        sums[3] += all.score;
     }
     let m = Decimal::from(months.max(1));
     println!(

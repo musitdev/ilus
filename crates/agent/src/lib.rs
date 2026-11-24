@@ -18,6 +18,7 @@
 
 pub mod account;
 pub mod candles;
+pub mod dataset;
 pub mod decision;
 pub mod genome;
 pub mod simulate;
