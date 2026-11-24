@@ -736,6 +736,10 @@ Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 
 - **Fold score**: `mean(train) − gap_weight × |mean(train) − mean(test)|` (`--gap-weight`, default 1): the difference between the training and test months is minimised.
 - **Fitness**: the mean of the fold scores. Every month is used by the fitness; `--test` periods are then a **holdout**, never used for selection.
 
+**Random trader** (`select::baseline::RandomTrader`, the baseline): on each candle, when flat it opens with probability `p_open` on a random side, in position it closes with probability `p_close` (at the close); same account as the agents. Deterministic for its seed.
+
+**Example `compare_months`**: for each calendar month (candles from a CSV, e.g. saved by `evolve --save`), with the month score: the best of N random traders (1.5 positions per day, stop-loss drawn in the gene's range; N = the number of genomes evaluated by the full evolution of that month), the best agent evolved with the 15m divergence only (the other rules' weights at 0) and the best agent evolved with all the rules.
+
 **Example `evolve`**: SOL/USDT 15m.
 - Periods: `--train FROM:TO` (repeatable): the fitness is the **mean** (`--combine mean`, default) or the **worst** (`--combine min`) of the gains on the training periods (e.g. a bull and a bear month); `--test FROM:TO` (repeatable): only measured on the final population, never used for selection. Without `--train`: the last `--days` (30) days.
 - Cross-validation mode: `--months N --start YYYY-MM-01` (one period per calendar month), with the score above.

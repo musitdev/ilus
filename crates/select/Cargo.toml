@@ -9,7 +9,7 @@ license.workspace = true
 agent.workspace = true
 trading.workspace = true
 rust_decimal.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 rust_decimal_macros.workspace = true

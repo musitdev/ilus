@@ -333,6 +333,14 @@ options (population, generations, elite, mutation rate, sigma min / max,
 crossover, tournament, patience, min improvement, seed), as are the account
 settings (leverage, fee):
 
+**`compare_months`** (crate `select`): per month, the best of N random
+traders vs the best agent evolved with the 15m divergence only and with all
+the rules (same score, same number of tries):
+
+```sh
+cargo run --release -p select --example compare_months -- --candles year.csv
+```
+
 ```sh
 cargo run --release -p select --example evolve -- \
   --train 2026-09-01:2026-10-01 --train 2026-10-01:2026-11-01 \
@@ -450,7 +458,10 @@ crates/agent/              the multi-rule agent
 crates/select/             evolutionary search of agent genomes
   src/lib.rs            evolve: the genetic algorithm, history
   src/rng.rs            deterministic random generator (SplitMix64)
-  examples/evolve.rs    evolution of agents on the last month of SOL/USDT 15m
+  src/score.rs          month score (activity), train / test folds, cross score
+  src/baseline.rs       random trader (baseline)
+  examples/evolve.rs    evolution of agents on SOL/USDT 15m (periods, cross-validation)
+  examples/compare_months.rs  per month: random traders vs evolved agents
 ```
 
 ---
