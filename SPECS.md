@@ -621,6 +621,54 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 - [ ] Each rule: a buy case, a sell case and a no-signal case; a cross triggers once per cross.
 - [ ] A breakout is not a pullback.
 
+### F9 — Multi-rule agent (weighted votes)
+
+A trading agent combines several **rules**. Each rule is an ordinary chain of the graph (source → transformers → **voter** condition → vote action); its action sends **vote modifiers** to one **decision condition**, which adds up the weights and decides to open or exit a position. The rule parameters and the weights are the genes of a later selection algorithm (not part of this feature).
+
+```text
+15m source ─┬─> Rsi ──> DivergenceVoter ──> SendVotes ──┐
+            ├─> Aggregate 1h ─> OnValue(Rsi) ─> Projected(DivergenceVoter) ─> SendVotes ──┤
+            ├─> Combine(Ema fast, Ema slow) ─> EmaCrossVoter ─> SendVotes ──┤  Vote modifiers
+            ├─> Trend(EMA n) ─> TrendVoter ─> SendVotes ──┤
+            ├─> PatternVoter (13 patterns) ─> SendVotes ──┘
+            └─> Decision ──> account action (sends Closed back on stop / liquidation)
+```
+
+**Ballots** (emitted by voters, several per candle possible):
+- `Open(side)`: the rule wants a position on `side` (long / short). It replaces the rule's previous open ballot (an opposite one is invalidated by it).
+- `Revoke`: the rule's open ballot is invalidated (its condition no longer holds).
+- `Exit(side)`: the rule wants the `side` position closed. It replaces the rule's previous exit ballot.
+
+**Voters** (one per rule, each a condition; the criteria below are fixed, their parameters are genes):
+
+| Voter | Input | Open | Revoke | Exit |
+|---|---|---|---|---|
+| `DivergenceVoter` | candles + RSI | bullish divergence → long, bearish → short | the close breaks the B pivot (below B's low for a long, above B's high for a short) | RSI exit: a high pivot with RSI above `exit_high` → exit long; a low pivot with RSI below `exit_low` → exit short |
+| `EmaCrossVoter` | `(fast, slow)` EMAs | fast crosses above slow → long, below → short (the opposite cross replaces the vote) | — | the cross down → exit long, up → exit short |
+| `TrendVoter` | candles + `Trend` | trend becomes up → long, down → short (on change only) | the trend becomes flat | the trend becomes down → exit long, up → exit short |
+| `PatternVoter` | candles | bullish pattern(s) → long, bearish → short (both on the same candle: none); the opposite replaces the vote | the close breaks the low (long) / high (short) of the pattern's last candle | a bearish pattern → exit long, bullish → exit short |
+
+**Vote action** (`SendVotes`): sends each ballot of a detection to the decision condition as `Vote { rule, ballot, weight }`, with the rule's **open weight** for `Open` and its **exit weight** for `Exit` (genes; a weight of 0 disables that part of the rule).
+
+**Decision condition** (`Decision`, input: the candles of the trading timeframe):
+- Keeps, per rule, its last open ballot and its last exit ballot with their weights.
+- **Flat**: long score = sum of the open-long weights, short score = sum of the open-short weights. Opens long when `long − short ≥ open_threshold`, short when `short − long ≥ open_threshold` (gene, > 0). Exit ballots are ignored.
+- **In position**: exits when the sum of the exit weights against the position reaches `exit_threshold` (gene, > 0). Open ballots are ignored (not stored); `Revoke` always applies.
+- It decides from `on_modifier` (within the tick, the order of the votes does not matter), **at most once per candle**; after each open or exit, **every ballot is cleared**.
+- It emits one event per candle (`Tick`, from `on_data`) so that the account sees every candle (stop-loss, liquidation), plus one event per decision (`Open(side)`, `Exit(side)`), with the scores.
+- Modifier `Closed`: the account closed the position by itself (stop-loss, liquidation): the decision is flat again and every ballot is cleared.
+
+**Other timeframes** (`Projected`): a voter on a longer timeframe reads the output of an `Aggregate` (e.g. 15m → 1h) followed by `OnValue(Rsi)`; `Projected` runs the voter on the aggregated candle and its RSI, **only when the aggregated candle is new** (the aggregate repeats it on every 15m candle). Aggregating the trading source keeps the timeframes aligned in replay (two sources are not time-aligned there). The source bootstrap should be raised with `with_bootstrap` to cover the longer timeframe's warm-up.
+
+**Test agent** (`backtest_agent` example): 15m and 1h divergences, a fast / slow EMA cross, a trend vote and the 13 patterns on 15m, fixed weights and thresholds, the futures simulation account (stop-loss and liquidation as a safety net, fees).
+
+**Acceptance criteria**
+- [ ] Each voter emits its open, revoke and exit ballots on the criteria of the table, and nothing otherwise.
+- [ ] `SendVotes` sends one vote per ballot with the rule's open / exit weight.
+- [ ] The decision opens on the net score reaching the threshold, exits on the exit score, ignores the ballots that do not fit its state, decides at most once per candle and clears every ballot after a decision or `Closed`.
+- [ ] `Projected` runs its condition once per new aggregated candle.
+- [ ] In a graph, votes sent within a tick trigger the decision in the same tick.
+
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.
 - **CLI**: to be defined (at least: start the bot).

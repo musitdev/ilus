@@ -102,6 +102,8 @@ Key properties:
   - `Ema`: exponential moving average of the closes (seeded with the mean of
     the first `period` closes). Output: `EmaCandle` (candle + EMA).
   - `Macd`: MACD line, signal line and histogram (default 12 / 26 / 9).
+  - `Trend`: EMA of the closes and the trend side (close above / below it),
+    on any item containing a candle.
   - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
     complete periods are sent.
   - `Combine`: runs 2 or 3 transformers on the same input as one node.
@@ -130,6 +132,18 @@ Key properties:
 
     Lows and highs are *pivots* (`left` / `right` candles around them).
     Defaults depend on the timeframe (`DivergenceParams::for_timeframe`).
+  - `TrendFilter`: wraps any condition; only its signals in the trend
+    direction pass (EMA rule 3).
+  - `Projected`: runs a condition on a part of its input, once per new part
+    (e.g. a 1h divergence on candles aggregated from 15m).
+- **Multi-rule agent** (`agent`): each rule is a chain ending with a *voter*
+  condition (`DivergenceVoter`, `EmaCrossVoter`, `TrendVoter`,
+  `PatternVoter`) that emits open / revoke / exit ballots; its `SendVotes`
+  action sends them, with the rule's weights, as modifiers to one `Decision`
+  condition. The decision opens when the net open score reaches its
+  threshold, exits when the exit score does, at most once per candle, and
+  clears every ballot after a decision. Weights, thresholds and rule
+  parameters are the genes of a later selection algorithm.
 - **Actions**
   - `Alert`: prints the trigger event. Works with any condition.
 
@@ -282,6 +296,16 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |
 
+**`backtest_agent`** (test multi-rule agent, 15m): five rules vote (15m and
+1h RSI divergences, EMA 9/21 cross, trend EMA 50, the 13 patterns) with
+fixed weights; the decision trades on the futures simulation account (the
+stop-loss stays as a safety net). Same options as `backtest_futures` for the
+period, leverage, stop, divergences, RSI exits and fees:
+
+```sh
+cargo run --release --example backtest_agent -- --days 60 --leverage 2 --stop 3 15m 0.05
+```
+
 ### Chart window
 
 **`chart_futures`** runs the futures simulation and shows the result in a
@@ -352,11 +376,17 @@ src/
   transformer/macd.rs MACD transformer
   transformer/aggregate.rs  aggregation (1m -> 5m, ...)
   transformer/combine.rs    combined transformer and adapters
+  transformer/trend.rs      trend (close vs EMA)
   transformer/chart.rs chart transformer + window (feature `chart`)
   condition.rs        Condition trait
   condition/divergence.rs  RSI divergence condition
   condition/patterns.rs    candlestick pattern condition (13 patterns)
   condition/ema_rules.rs   EMA buy / sell rules
+  condition/filter.rs      trend filter
+  condition/projected.rs   condition on a part of the input (other timeframe)
+  agent.rs            ballots, votes, SendVotes action
+  agent/decision.rs   decision condition (weighted votes)
+  agent/voters.rs     one voter condition per rule
   trigger.rs          Detection, TriggerEvent
   action.rs           Action trait, ActionContext, Alert
   modifier.rs         modifiers and handles
@@ -365,6 +395,11 @@ examples/             runnable examples (see above)
   common/             helpers for the flow_* examples and simple
   support/futures.rs  futures simulation shared by backtest_futures and chart_futures
 tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
+tests/trend_filter.rs trend filter in a graph
+tests/agent.rs        votes triggering the decision in the same tick
+tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
+                      against an independent computation
+tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
 ```
 
 ---

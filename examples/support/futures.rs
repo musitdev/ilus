@@ -418,8 +418,9 @@ impl<R: TradeRecorder, I> Futures<R, I> {
 }
 
 impl<R: TradeRecorder, I> Futures<R, I> {
-    /// Process one candle (and its divergence, if any).
-    fn step(&mut self, value: &Signal, c: &Candle) {
+    /// Start of a candle: account start (first candle), stop-loss and
+    /// liquidation checks.
+    fn begin(&mut self, c: &Candle) {
         self.time = c.open_time;
         let when = fmt_time(c.open_time);
         self.last_price = c.close;
@@ -438,6 +439,37 @@ impl<R: TradeRecorder, I> Futures<R, I> {
 
         self.check_stop(&when, c.open, c.low, c.high);
         self.check_liquidation(&when, c.low, c.high);
+    }
+
+    /// Agent account (`backtest_agent`): a new candle (stop-loss,
+    /// liquidation). Returns `true` if they closed the position.
+    pub fn agent_candle(&mut self, c: &Candle) -> bool {
+        let open = self.position.is_some();
+        self.begin(c);
+        open && self.position.is_none()
+    }
+
+    /// Agent account: open `side` at the close of `c` (if flat, with equity).
+    pub fn agent_open(&mut self, side: Side, c: &Candle) {
+        if self.position.is_none() && self.equity.is_some_and(|e| e > Decimal::ZERO) {
+            self.open(&fmt_time(c.open_time), side, c.close);
+        }
+    }
+
+    /// Agent account: close the position at the close of `c`.
+    pub fn agent_exit(&mut self, c: &Candle) {
+        self.close(&fmt_time(c.open_time), c.close, TradeKind::Close);
+    }
+
+    /// Agent account: add a line to the log.
+    pub fn agent_log(&mut self, line: &str) {
+        let _ = writeln!(self.log, "{line}");
+    }
+
+    /// Process one candle (and its divergence, if any).
+    fn step(&mut self, value: &Signal, c: &Candle) {
+        self.begin(c);
+        let when = fmt_time(c.open_time);
         if self.position.is_none() && self.equity == Some(Decimal::ZERO) {
             return; // no equity left
         }

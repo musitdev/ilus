@@ -26,6 +26,7 @@
 //! Everything is wired in code: no configuration file.
 
 pub mod action;
+pub mod agent;
 pub mod candle;
 pub mod condition;
 pub mod error;
