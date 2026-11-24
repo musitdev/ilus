@@ -80,14 +80,7 @@ impl ThresholdSet {
     }
 }
 
-/// Direction of a signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Signal {
-    /// Possible rise.
-    Bullish,
-    /// Possible fall.
-    Bearish,
-}
+pub use crate::condition::Signal;
 
 /// The 13 patterns, in table order (spec F0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

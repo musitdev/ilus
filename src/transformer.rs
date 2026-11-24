@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod chart;
 pub mod combine;
 pub mod ema;
+pub mod macd;
 pub mod rsi;
 
 use std::fmt;

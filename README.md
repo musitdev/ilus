@@ -101,6 +101,7 @@ Key properties:
     (candle + RSI).
   - `Ema`: exponential moving average of the closes (seeded with the mean of
     the first `period` closes). Output: `EmaCandle` (candle + EMA).
+  - `Macd`: MACD line, signal line and histogram (default 12 / 26 / 9).
   - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
     complete periods are sent.
   - `Combine`: runs 2 or 3 transformers on the same input as one node.
@@ -114,6 +115,15 @@ Key properties:
     evening star, harami, piercing line, dark cloud cover), with a default
     threshold set that can be overridden. Several patterns matching the same
     candle are reported in one detection.
+  - EMA buy / sell rules (`condition::ema_rules`):
+    - `PriceCrossEma`: the close crosses its EMA;
+    - `EmaCross`: a fast EMA crosses a slow one (9/21, 50/200…);
+    - `EmaPullback`: in a trend, the price dips to the short EMA and closes
+      back on the trend side;
+    - `EmaRibbon`: three EMAs become aligned;
+    - `MacdCross`: the MACD line crosses its signal line.
+
+    A cross triggers once, on the candle where it happens.
   - `RsiDivergence`: detects divergences between price and RSI:
     - *bullish*: price makes a lower low while RSI makes a higher low;
     - *bearish*: price makes a higher high while RSI makes a lower high.
@@ -211,12 +221,14 @@ cargo run --example flow_modes
 | `rsi_divergence` | SOL/USDT 1m → RSI(14) → divergence detection; prints each divergence detected on the live feed. |
 | `merge_rsi` | SOL/USDT 15m + 1h merged, with an RSI on each timeframe; prints when RSI 15m < 30 and RSI 1h < 40 (replay of the last days). |
 | `candle_patterns` | The 13 candlestick patterns on SOL/USDT history; prints each candle with its patterns, then a count per pattern. |
+| `ema_signals` | The five EMA rules on SOL/USDT history, all at once on the same source; prints each buy / sell signal, then a count per rule. |
 
 ```sh
 cargo run --example binance_sol_rsi     # Ctrl+C to stop
 cargo run --example rsi_divergence      # Ctrl+C to stop
 cargo run --example merge_rsi -- 7      # last 7 days
 cargo run --example candle_patterns -- 3 15m   # last 3 days, 15m
+cargo run --example ema_signals -- 2 15m       # last 2 days, 15m
 ```
 
 ### Backtests on Binance history
@@ -311,12 +323,14 @@ src/
   transformer.rs      Transformer trait, Derived
   transformer/rsi.rs  RSI transformer
   transformer/ema.rs  EMA transformer
+  transformer/macd.rs MACD transformer
   transformer/aggregate.rs  aggregation (1m -> 5m, ...)
   transformer/combine.rs    combined transformer and adapters
   transformer/chart.rs chart transformer + window (feature `chart`)
   condition.rs        Condition trait
   condition/divergence.rs  RSI divergence condition
   condition/patterns.rs    candlestick pattern condition (13 patterns)
+  condition/ema_rules.rs   EMA buy / sell rules
   trigger.rs          Detection, TriggerEvent
   action.rs           Action trait, ActionContext, Alert
   modifier.rs         modifiers and handles

@@ -580,6 +580,31 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 - [ ] Every input item is forwarded, also when the window is closed.
 - [ ] Each candle is sent to the window with its indicator value; each marker modifier is sent to the window.
 
+### F8 — EMA buy / sell rules
+**Why:** Moving averages give simple, widely used trend signals. These rules are conditions built on the EMA transformer (F4) and on MACD.
+
+**MACD transformer**: input candles; MACD line = `EMA(fast) − EMA(slow)` of the closes; signal line = EMA of the MACD line over `signal` values; histogram = MACD − signal. Default 12 / 26 / 9. Warm-up: `slow + signal − 1` candles.
+
+**Rules** (`Signal::Bullish` = buy, `Signal::Bearish` = sell):
+
+| # | Condition | Input | Buy | Sell |
+|---|---|---|---|---|
+| 1 | `PriceCrossEma` | `Ema` | the close crosses above the EMA | the close crosses below |
+| 2 | `EmaCross` | `Combine((Ema fast, Ema slow))` | fast crosses above slow (e.g. 9/21; 50/200: golden cross) | fast crosses below (death cross) |
+| 4 | `EmaPullback` | `Combine((Ema short, Ema trend))` | short EMA and close above the trend EMA; the previous close was above the short EMA; the low touches the short EMA and the close is back above | the mirror in a downtrend |
+| 5 | `EmaRibbon` | `Combine((Ema a, Ema b, Ema c))` | the EMAs become aligned upward (a > b > c) | aligned downward (a < b < c) |
+| 6 | `MacdCross` | `Macd` | the MACD line crosses above its signal line | crosses below |
+
+- A cross triggers **once**, on the item where the side changes; touching (`a = b`) does not change the side; the first item only sets the side (no signal).
+- A ribbon triggers when the alignment **starts** (not while it lasts, not if already aligned on the first item).
+- A pullback requires the previous close on the trend side of the short EMA, which excludes breakouts.
+- Rule 3 (trend filter: only buys above a long EMA) is not a signal but a filter on other signals: not implemented yet.
+
+**Acceptance criteria:**
+- [ ] EMA and MACD values match hand-computed sequences.
+- [ ] Each rule: a buy case, a sell case and a no-signal case; a cross triggers once per cross.
+- [ ] A breakout is not a pullback.
+
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.
 - **CLI**: to be defined (at least: start the bot).
