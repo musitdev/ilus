@@ -9,7 +9,10 @@ pub mod aggregate;
 #[cfg(feature = "chart")]
 pub mod chart;
 pub mod combine;
+pub mod ema;
+pub mod macd;
 pub mod rsi;
+pub mod trend;
 
 use std::fmt;
 

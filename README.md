@@ -99,6 +99,9 @@ Key properties:
 - **Transformers**
   - `Rsi`: RSI (Wilder smoothing, default period 14). Output: `RsiCandle`
     (candle + RSI).
+  - `Ema`: exponential moving average of the closes (seeded with the mean of
+    the first `period` closes). Output: `EmaCandle` (candle + EMA).
+  - `Macd`: MACD line, signal line and histogram (default 12 / 26 / 9).
   - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
     complete periods are sent.
   - `Combine`: runs 2 or 3 transformers on the same input as one node.
@@ -107,6 +110,20 @@ Key properties:
   - `Chart` (feature `chart`): shows candles, RSI and trade markers in a native
     window.
 - **Conditions**
+  - `PatternCondition`: the 13 classic candlestick patterns (engulfing,
+    hammer, hanging man, inverted hammer, shooting star, doji, morning and
+    evening star, harami, piercing line, dark cloud cover), with a default
+    threshold set that can be overridden. Several patterns matching the same
+    candle are reported in one detection.
+  - EMA buy / sell rules (`condition::ema_rules`):
+    - `PriceCrossEma`: the close crosses its EMA;
+    - `EmaCross`: a fast EMA crosses a slow one (9/21, 50/200…);
+    - `EmaPullback`: in a trend, the price dips to the short EMA and closes
+      back on the trend side;
+    - `EmaRibbon`: three EMAs become aligned;
+    - `MacdCross`: the MACD line crosses its signal line.
+
+    A cross triggers once, on the candle where it happens.
   - `RsiDivergence`: detects divergences between price and RSI:
     - *bullish*: price makes a lower low while RSI makes a higher low;
     - *bearish*: price makes a higher high while RSI makes a lower high.
@@ -119,9 +136,6 @@ Key properties:
 Splitting a source needs no special entity: one output can feed several
 consumers (fan-out). A transformer or a condition never processes the same
 value twice.
-
-Planned in the spec but not implemented yet: the 13 candlestick pattern
-conditions (spec F0).
 
 ---
 
@@ -206,11 +220,15 @@ cargo run --example flow_modes
 | `binance_sol_rsi` | SOL/USDT 1m → RSI(14); prints every candle with its RSI (the bootstrap candles first), and alerts on live candles when RSI < 30 or > 70. |
 | `rsi_divergence` | SOL/USDT 1m → RSI(14) → divergence detection; prints each divergence detected on the live feed. |
 | `merge_rsi` | SOL/USDT 15m + 1h merged, with an RSI on each timeframe; prints when RSI 15m < 30 and RSI 1h < 40 (replay of the last days). |
+| `candle_patterns` | The 13 candlestick patterns on SOL/USDT history; prints each candle with its patterns, then a count per pattern. |
+| `ema_signals` | The five EMA rules on SOL/USDT history, all at once on the same source; prints each buy / sell signal, then a count per rule. |
 
 ```sh
 cargo run --example binance_sol_rsi     # Ctrl+C to stop
 cargo run --example rsi_divergence      # Ctrl+C to stop
 cargo run --example merge_rsi -- 7      # last 7 days
+cargo run --example candle_patterns -- 3 15m   # last 3 days, 15m
+cargo run --example ema_signals -- 2 15m       # last 2 days, 15m
 ```
 
 ### Backtests on Binance history
@@ -231,10 +249,14 @@ cargo run --example backtest_divergence -- --days 7 15m 0 0.2
 ```
 
 **`backtest_futures`** (futures with leverage). It starts with 10 SOL of
-capital, converted to USDT at the first candle. A bullish divergence opens a
-long and a bearish divergence opens a short; any opposite position is closed
-first. It also simulates fees (on the position size), an optional stop-loss
-and liquidation. Funding is ignored.
+capital, converted to USDT at the first candle. When flat, a bullish
+divergence opens a long and a bearish divergence opens a short. An open
+position closes only on its exit rules: the **RSI exit** (a long at the next
+price high (pivot) with RSI above 75, a short at the next low with RSI below
+30), the stop-loss or a liquidation; divergences are ignored while it is open
+(`--flip-on-divergence` restores the previous behaviour: an opposite
+divergence closes it and opens the opposite one). It also simulates fees (on
+the position size). Funding is ignored.
 
 ```sh
 cargo run --example backtest_futures -- [options] [timeframe] [fees %...]
@@ -250,7 +272,12 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `--leverage L` | leverage | 10 |
 | `--stop P` | stop-loss, in % of price against the entry | none |
 | `--left N` / `--right N` | pivot candles before / after (`right` = confirmation delay) | 3 / 3 |
-| `--min-gap N` / `--max-gap N` | distance between two compared pivots, in candles | 60 max; min 5 at 1m, 3 at 5m, 2 from 15m |
+| `--min-gap N` | minimum distance between the two pivots of a divergence, in candles | 5 at 1m, 3 at 5m, 2 from 15m |
+| `--rsi-low R` / `--rsi-high R` | RSI level of the first low / high of a divergence (100 / 0: any level) | 30 / 70 |
+| `--lookahead N` | pivots after the first one in which the diverging one is searched | 3 |
+| `--flip-on-divergence` | an opposite divergence closes the position and opens the opposite one | off |
+| `--trend N` | trend filter (EMA rule 3): enter long only above the EMA N of the closes, short only below; exits not filtered (`backtest_futures` only) | none |
+| `--exit-rsi-high R` / `--exit-rsi-low R` | RSI exit: a long closes at the next high pivot with RSI above R, a short at the next low pivot with RSI below R (100 / 0: disabled) | 75 / 30 |
 | `--tick-ms N` | replay tick, in ms (0: as fast as possible) | 0 |
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |
@@ -270,6 +297,33 @@ cargo run --features chart --example chart_futures -- --from 2026-09-22 --to 202
 
 - Markers: green ▲ long, red ▼ short, grey ○ close, orange ✕ stop-loss,
   purple ✱ liquidation.
+- Divergences: a segment between the two pivots on the price and on the RSI
+  (blue bullish, pink bearish); the trade they open is at the end of the
+  segments.
+
+**`chart_patterns`** shows the candlestick patterns detected on SOL/USDT
+history, to inspect them: a blue ▲ under the low for bullish patterns, a pink ▼
+above the high for bearish ones, on the candle that confirms them. The label
+lists the patterns (several can match the same candle).
+
+```sh
+cargo run --features chart --example chart_patterns -- [days] [timeframe]
+cargo run --features chart --example chart_patterns -- 2 15m
+```
+
+**`chart_signals`** shows everything on one chart, on SOL/USDT history:
+- curves EMA 9 (yellow) and EMA 21 (purple) over the candles, RSI(14) in the
+  bottom panel;
+- EMA rules (price × EMA 9, EMA 9 × 21, pullback 9/21): big green ▲ buy / red
+  ▼ sell at the close, labelled with the rule;
+- RSI divergences: a segment between the two pivots on the price **and** on
+  the RSI (blue bullish, pink bearish);
+- candlestick patterns: small blue ▲ / pink ▼.
+
+```sh
+cargo run --features chart --example chart_signals -- [days] [timeframe]
+cargo run --features chart --example chart_signals -- 2 15m
+```
 - Navigation:
   - mouse wheel: zoom the time axis;
   - left-drag: pan;
@@ -294,11 +348,15 @@ src/
   candle.rs           Candle (OHLCV)
   transformer.rs      Transformer trait, Derived
   transformer/rsi.rs  RSI transformer
+  transformer/ema.rs  EMA transformer
+  transformer/macd.rs MACD transformer
   transformer/aggregate.rs  aggregation (1m -> 5m, ...)
   transformer/combine.rs    combined transformer and adapters
   transformer/chart.rs chart transformer + window (feature `chart`)
   condition.rs        Condition trait
   condition/divergence.rs  RSI divergence condition
+  condition/patterns.rs    candlestick pattern condition (13 patterns)
+  condition/ema_rules.rs   EMA buy / sell rules
   trigger.rs          Detection, TriggerEvent
   action.rs           Action trait, ActionContext, Alert
   modifier.rs         modifiers and handles

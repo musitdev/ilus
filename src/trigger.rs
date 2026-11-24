@@ -43,6 +43,16 @@ pub enum TriggerEventType {
     BullishDivergence,
     /// Price higher high with RSI lower high (spec F6).
     BearishDivergence,
+    /// Close crossing its EMA (EMA rule 1).
+    EmaPriceCross,
+    /// Fast EMA crossing the slow EMA (EMA rule 2).
+    EmaCross,
+    /// Pullback to the short EMA in a trend (EMA rule 4).
+    EmaPullback,
+    /// EMAs becoming aligned (EMA rule 5).
+    EmaRibbon,
+    /// MACD crossing its signal line (EMA rule 6).
+    MacdCross,
     /// Any other kind of detection, identified by name.
     Other(&'static str),
 }

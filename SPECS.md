@@ -268,7 +268,7 @@ struct Executor { /* graph, tick, clock */ }
 **General rules:**
 - A pattern is only checked once its last candle has **closed**. A trigger is never emitted for a candle still in progress, and once emitted it is never withdrawn.
 - A given pattern triggers at most once per candle.
-- Multiple patterns can match the same candle. Since a condition emits one event at a time, see Open questions for how this is resolved.
+- Multiple patterns can match the same candle: the condition emits **one detection listing every match**, in table order; its event type is the first match. A condition can watch only some patterns (`only(&[...])`, e.g. one condition per pattern) or one signal (modifier `WatchOnly(Bullish | Bearish)`).
 - Detection starts only once enough closed candles exist to compute the averages (`AVG_LEN`) and the trend reference used by the pattern.
 
 **Candle measures** — computed on a closed candle with open `O`, high `H`, low `L`, close `C`:
@@ -283,6 +283,8 @@ struct Executor { /* graph, tick, clock */ }
 - **Equality tolerance**: two values are considered equal when they differ by less than `EPSILON × price`, so that exact threshold hits are handled consistently.
 
 **Threshold sets:** candlestick definitions vary between authors and tools, so ilus is designed to support **several threshold sets** (e.g. strict, loose, author-specific). For now only one set is defined: `default`, holding the most commonly used values below. The implementation must keep thresholds as data (not hard-coded in pattern logic) so that new sets can be added without changing pattern code.
+
+In code: `PatternCondition::new(ThresholdSet::default())`; a single value can be overridden (`ThresholdSet { long_shadow: dec!(3), ..Default::default() }`), and a set can be replaced while running with the modifier `SetThresholds` (except `AVG_LEN` and `TREND_LEN`, which size the history). Warm-up: `TREND_LEN + 3` candles (trend defined on the candle preceding a 3-candle pattern).
 
 **Default threshold set (`default`):**
 
@@ -445,6 +447,11 @@ struct Executor { /* graph, tick, clock */ }
 - The transformed source inherits the asset and timeframe of its input.
 - Its output can feed any number of consumers (fan-out); it is computed once per item. Its items keep the running mode of the input (§5.3).
 
+**EMA transformer** (Exponential Moving Average):
+- Input: candles. Output: `EmaCandle = Derived<Candle, Decimal>`: each candle with the EMA of the closes, `None` during warm-up.
+- Parameter: `period` (≥ 1). `EMA = previous EMA + k × (close − previous EMA)`, with `k = 2 / (period + 1)`. The first value is the plain mean of the first `period` closes. Warm-up: `period` candles.
+- The same calculation (`EmaCalc`) is used by the prior trend of the candlestick patterns (F0).
+
 **Aggregation transformer** (e.g. 1m → 5m):
 - Builds candles of a longer timeframe from the input candles, on boundaries aligned to the clock (00:00, 00:05, …): open of the first candle, highest high, lowest low, close of the last one, sum of volumes.
 - It emits on **each input candle**: `Derived { data: 1m candle, value: Option<5m candle> }`, where the value is the **last completed** 5m candle, sent again until the next one completes (`None` before the first one). A 5m candle is completed by the 1m candle that closes its period; the 5m candle still forming is never sent (closed data only).
@@ -531,8 +538,11 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 | Bullish (bear phase) | minima | `price B < price A` | `RSI B > RSI A` |
 | Bearish (bull phase) | maxima | `price B > price A` | `RSI B < RSI A` |
 
-- The time between A and B (measured on the pivot times, so independent of the timeframe and of missing candles) must be within `[min_gap, max_gap]`, bounds included; otherwise no divergence (too close = noise, too far = unrelated).
-- Whatever the result, B becomes the new previous pivot.
+**Search** (lows; highs are the mirror, with `rsi_high` and "higher"):
+- A low **starts a search** (first pivot A) only if its RSI is **at most `rsi_low`** (e.g. 30). With `rsi_low` = 100 (and `rsi_high` = 0 for highs), any low starts a search (divergences at any RSI level).
+- The diverging low B is searched in the **next `lookahead` lows** after A (e.g. 3). The first one that diverges (lower price, higher RSI) and comes at least `min_gap` after A (pivot times, so independent of missing candles) gives the signal, when B is confirmed. **A is consumed**: the next signal needs a new A (B does not start one).
+- A low that does not diverge and has a **lower RSI than A** becomes the **new A** and restarts the window. Other lows (including oversold ones with a higher RSI than A) only count.
+- After `lookahead` lows without divergence, **A expires**; the last low may then start a new search.
 
 **Default parameters** (`DivergenceParams::for_timeframe`; `Default` = 1m):
 
@@ -541,9 +551,11 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 | `left` | 3 candles | candles before a pivot |
 | `right` | 3 candles | candles after a pivot (confirmation delay) |
 | `min_gap` | 5 candles at 1m (5 min), 3 at 5m (15 min), 2 from 15m up (30 min at 15m) | min time between A and B |
-| `max_gap` | 60 candles (1 h at 1m, 15 h at 15m) | max time between A and B |
+| `rsi_low` | 30 | max RSI of the first low (100: any level) |
+| `rsi_high` | 70 | min RSI of the first high (0: any level) |
+| `lookahead` | 3 pivots | pivots after A in which B is searched |
 
-The gaps are durations whose defaults depend on the candle duration, so a timeframe change keeps a sensible meaning.
+`min_gap` is a duration whose default depends on the candle duration, so a timeframe change keeps a sensible meaning.
 
 **Detection value:** kind (bullish/bearish), pivot A and pivot B (time, price, RSI), confirmation time. Event types: `BullishDivergence`, `BearishDivergence`.
 
@@ -551,19 +563,23 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 - [ ] Given a lower price minimum with a higher RSI, Then a bullish divergence is emitted when pivot B is confirmed.
 - [ ] Given a higher price maximum with a lower RSI, Then a bearish divergence is emitted when pivot B is confirmed.
 - [ ] Given a lower price minimum with a lower RSI, Then nothing is emitted.
-- [ ] Given pivots closer than `min_gap` or farther than `max_gap` (in time), Then nothing is emitted.
+- [ ] Given pivots closer than `min_gap` (in time), Then nothing is emitted.
+- [ ] A first low with RSI above `rsi_low` starts no search (first high: below `rsi_high`).
+- [ ] The diverging pivot is searched in the next `lookahead` pivots only; then A expires.
+- [ ] A non-diverging pivot with a more extreme RSI than A becomes the new A; other pivots only count.
+- [ ] A is consumed by a divergence.
 - [ ] The default gaps depend on the timeframe (e.g. 30 min minimum at 15m).
 - [ ] No detection is emitted before the `right` candles after pivot B have closed.
 - [ ] A pivot without RSI (warm-up) is ignored.
-- [ ] Invalid parameters (`left` or `right` = 0, negative `min_gap`, `min_gap > max_gap`) are rejected.
+- [ ] Invalid parameters (`left`, `right` or `lookahead` = 0, negative `min_gap`, RSI levels outside 0..=100) are rejected.
 
 ### F7 — Chart transformer
 **Why:** To understand a strategy, one needs to see the candles, the indicator and the trades together.
 
 **Behavior** (cargo feature `chart`, crates `eframe` + `egui_plot`):
-- `chart(title, indicator_name)` creates a `Chart` transformer and a `ChartWindow`.
+- `chart(title, indicator_name)` creates a `Chart` transformer and a `ChartWindow` for candles or candles with an indicator; `chart_with(title, curve_names, indicator_name, frame)` for any item: `frame` gives, for each item, the candle, the **curves drawn over the price** (e.g. EMAs) and the indicator value.
 - The transformer accepts candles, or candles with an indicator value (e.g. `RsiCandle`). Like every transformer it forwards every input item (value `()`), and sends each candle to the window.
-- It accepts the modifier `ChartModifier::Marker { time, price, kind, label }`, sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation.
+- It accepts the modifiers `ChartModifier::Marker { time, price, kind, label }` and `ChartModifier::Segment { panel, from, to, kind, label }` (a line between two points of the price or indicator panel, e.g. the pivots of a divergence) and `ChartModifier::Point { panel, time, value, kind, label }` (a labelled point, e.g. the pivots A and B of a divergence on the RSI curve), sent by actions. Kinds: buy/long, sell/short, close, stop-loss, liquidation (trades), and bullish / bearish signal (e.g. candlestick patterns). Signals are drawn first, trades on top.
 - The window shows the candles (green up / red down) with the markers, and the indicator in a second panel (with 30/70 lines), both on a shared time axis. It refreshes while data arrives.
 - Navigation: mouse wheel zooms the time axis around the cursor (both panels stay aligned); left-drag pans; right-drag zooms on a box; double-click resets. Toolbar: zoom in / out, *Fit all*, *Last 6h / 1d / 3d*, and *Auto-fit price* (on by default: the price axis fits the visible candles and markers; off: the price axis can be zoomed and dragged freely).
 - The window must run on the main thread; the executor runs in another thread. Closing the window does not stop data forwarding.
@@ -572,6 +588,38 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 **Acceptance criteria:**
 - [ ] Every input item is forwarded, also when the window is closed.
 - [ ] Each candle is sent to the window with its indicator value; each marker modifier is sent to the window.
+
+### F8 — EMA buy / sell rules
+**Why:** Moving averages give simple, widely used trend signals. These rules are conditions built on the EMA transformer (F4) and on MACD.
+
+**MACD transformer**: input candles; MACD line = `EMA(fast) − EMA(slow)` of the closes; signal line = EMA of the MACD line over `signal` values; histogram = MACD − signal. Default 12 / 26 / 9. Warm-up: `slow + signal − 1` candles.
+
+**Rules** (`Signal::Bullish` = buy, `Signal::Bearish` = sell):
+
+| # | Condition | Input | Buy | Sell |
+|---|---|---|---|---|
+| 1 | `PriceCrossEma` | `Ema` | the close crosses above the EMA | the close crosses below |
+| 2 | `EmaCross` | `Combine((Ema fast, Ema slow))` | fast crosses above slow (e.g. 9/21; 50/200: golden cross) | fast crosses below (death cross) |
+| 4 | `EmaPullback` | `Combine((Ema short, Ema trend))` | short EMA and close above the trend EMA; the previous close was above the short EMA; the low touches the short EMA and the close is back above | the mirror in a downtrend |
+| 5 | `EmaRibbon` | `Combine((Ema a, Ema b, Ema c))` | the EMAs become aligned upward (a > b > c) | aligned downward (a < b < c) |
+| 6 | `MacdCross` | `Macd` | the MACD line crosses above its signal line | crosses below |
+
+- A cross triggers **once**, on the item where the side changes; touching (`a = b`) does not change the side; the first item only sets the side (no signal).
+- A ribbon triggers when the alignment **starts** (not while it lasts, not if already aligned on the first item).
+- A pullback requires the previous close on the trend side of the short EMA, which excludes breakouts.
+- Rule 3 (trend filter) is not a signal but a filter on other signals, in two parts:
+  - **`Trend(EMA n)` transformer** (data): adds to each item the EMA of the closes and the trend side, **up** when the close is above the EMA, **down** when below, none when equal or warming up. It works on any item containing a candle (candles, candles + RSI, ...).
+  - **`TrendFilter(condition)` condition** (decision): wraps any condition (divergence, patterns, EMA rules); the wrapped condition sees every item, and its signals pass only in the trend direction: buys in an uptrend, sells in a downtrend, nothing when the trend is flat or unknown. Candlestick patterns are filtered one by one (a candle can carry both directions; the event type becomes the first pattern kept). `TrendFilter::disabled` lets everything pass (on/off gene). A detection triggered by a modifier passes only when the filter is disabled (no trend item then).
+  - Futures simulation: `--trend N`; only the **entries** (divergences) are filtered, the RSI exits and the stop-loss are not.
+
+**Price pivots** (`Pivots`, used by the divergence condition and by the futures simulation): a candle whose low (high) is strictly beyond the `left` candles before it and at least as far as the `right` candles after it, confirmed `right` candles later, with its RSI.
+
+**RSI exit** (futures simulation example): a long closes at the first **high** pivot after entry whose RSI is **above** `exit_rsi_high` (default 75); a short at the first **low** pivot whose RSI is **below** `exit_rsi_low` (default 30); at the close of the candle confirming the pivot. The stop-loss (and liquidation) stay; the first one closes the position. **Divergences are ignored while a position is open**: an opposite divergence does not close it (the exit thresholds, e.g. 75 / 30, differ from the divergence start thresholds, so an opposite divergence may come before the exit). After an exit, the account is flat until the next divergence. Option `--flip-on-divergence`: the previous behaviour (an opposite divergence closes the position and opens the opposite one).
+
+**Acceptance criteria:**
+- [ ] EMA and MACD values match hand-computed sequences.
+- [ ] Each rule: a buy case, a sell case and a no-signal case; a cross triggers once per cross.
+- [ ] A breakout is not a pullback.
 
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.
@@ -605,9 +653,7 @@ ilus is released under the **GNU GPL v3.0 or later** (GPL-3.0-or-later).
 ## 12. Open questions
 - F6: pivots use the candle low/high. Should closes be an option?
 - F6: should "hidden" divergences (trend continuation: higher price low with lower RSI low) be detected too?
-- How does a pattern condition select a threshold set in code (e.g. `ThresholdSet::default()`)? Can individual values be overridden per condition? → to decide during development.
 - Which additional threshold sets to define later, and from which sources? → later.
 - ~~Value of N~~ → resolved: 5 retries with exponential backoff (1 s → 60 s).
-- If several patterns match the same candle in one condition, which event is emitted: the first by table order, one event listing all matches, or one condition instance per pattern?
 - Modifier senders: "mostly by actions". Who else can send them: other conditions, an external command (CLI), a timer?
 - RSI: confirm defaults (`period` 14, on close, Wilder smoothing) and the rounding of the output.

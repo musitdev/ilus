@@ -1,6 +1,18 @@
 //! Conditions: detect situations on their input (spec F2).
 
 pub mod divergence;
+pub mod ema_rules;
+pub mod filter;
+pub mod patterns;
+
+/// Direction of a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Signal {
+    /// Possible rise: buy.
+    Bullish,
+    /// Possible fall: sell.
+    Bearish,
+}
 
 use crate::error::ModifierError;
 use crate::modifier::ModifierValue;
