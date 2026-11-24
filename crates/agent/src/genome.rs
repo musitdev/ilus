@@ -44,7 +44,7 @@ const W: (Decimal, Decimal, Decimal) = (dec!(0), dec!(5), dec!(0.25));
 const T: (Decimal, Decimal, Decimal) = (dec!(0.25), dec!(10), dec!(0.25));
 
 /// The genes, in genome order.
-pub const GENES: [Gene; 25] = [
+pub const GENES: [Gene; 26] = [
     // Weights (open / exit) of the five rules.
     gene("div15.open_weight", W.0, W.1, W.2),
     gene("div15.exit_weight", W.0, W.1, W.2),
@@ -75,6 +75,8 @@ pub const GENES: [Gene; 25] = [
     gene("ema.fast", dec!(5), dec!(50), dec!(1)),
     gene("ema.slow_gap", dec!(1), dec!(150), dec!(1)),
     gene("trend.period", dec!(20), dec!(300), dec!(1)),
+    // Account: stop-loss in % of the entry price.
+    gene("stop_pct", dec!(1), dec!(10), dec!(0.5)),
 ];
 
 /// Number of genes.
@@ -120,6 +122,8 @@ pub struct AgentParams {
     pub ema_slow: usize,
     /// Trend EMA period.
     pub trend_period: usize,
+    /// Stop-loss in % of the entry price.
+    pub stop_pct: Decimal,
 }
 
 /// Why a genome cannot be decoded.
@@ -217,6 +221,7 @@ impl AgentParams {
             ema_fast,
             ema_slow: ema_fast + count(v[23]),
             trend_period: count(v[24]),
+            stop_pct: v[25],
         })
     }
 
@@ -254,6 +259,7 @@ impl AgentParams {
             d(self.ema_fast),
             d(self.ema_slow.saturating_sub(self.ema_fast)),
             d(self.trend_period),
+            self.stop_pct,
         ])
         .collect();
         GENES.iter().zip(values).map(|(g, v)| g.encode(v)).collect()
@@ -272,7 +278,7 @@ impl fmt::Display for AgentParams {
         write!(
             f,
             "weights open/exit: div15 {}, div1h {}, ema {}, trend {}, patterns {}; \
-             thresholds open {} exit {}; div15 {}; div1h {}; EMA {}/{}; trend EMA {}",
+             thresholds open {} exit {}; div15 {}; div1h {}; EMA {}/{}; trend EMA {}; stop {}%",
             w(&self.div15),
             w(&self.div1h),
             w(&self.ema),
@@ -284,7 +290,8 @@ impl fmt::Display for AgentParams {
             d(&self.div1h_rule),
             self.ema_fast,
             self.ema_slow,
-            self.trend_period
+            self.trend_period,
+            self.stop_pct.normalize()
         )
     }
 }
@@ -301,6 +308,7 @@ mod tests {
         assert_eq!(min.div15_rule.rsi_low, dec!(20));
         assert_eq!(min.div15_rule.lookahead, 1);
         assert_eq!((min.ema_fast, min.ema_slow, min.trend_period), (5, 6, 20));
+        assert_eq!(min.stop_pct, dec!(1));
         let max = AgentParams::decode(&[1.0; GENOME_LEN]).unwrap();
         assert_eq!(max.patterns.exit, dec!(5));
         assert_eq!(max.decision.exit_threshold, dec!(10));
@@ -310,6 +318,7 @@ mod tests {
             (max.ema_fast, max.ema_slow, max.trend_period),
             (50, 200, 300)
         );
+        assert_eq!(max.stop_pct, dec!(10));
     }
 
     #[test]

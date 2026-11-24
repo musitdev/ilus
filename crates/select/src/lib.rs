@@ -19,6 +19,7 @@ use std::thread;
 use rust_decimal::Decimal;
 
 pub mod rng;
+pub mod score;
 
 use rng::Rng;
 

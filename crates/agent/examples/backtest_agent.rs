@@ -12,7 +12,8 @@
 //!
 //! `cargo run --release --example backtest_agent -- [--days N] [--leverage L]
 //! [--stop P] [--fee F] [--genome g1,g2,...] [--events]`
-//! (defaults: 60 days, 2x, stop 3 %, fee 0.05 %).
+//! (defaults: 60 days, 2x, fee 0.05 %; the stop is the genome's, 3 % for
+//! the hand-written agent; `--stop` overrides it).
 
 use agent::Weights;
 use agent::account::{AccountParams, EventKind};
@@ -49,13 +50,14 @@ fn hand_params() -> AgentParams {
         ema_fast: 9,
         ema_slow: 21,
         trend_period: 50,
+        stop_pct: dec!(3),
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut days: u64 = 60;
     let mut leverage = dec!(2);
-    let mut stop = Some(dec!(3));
+    let mut stop = None::<Decimal>;
     let mut fee = dec!(0.05);
     let mut params = hand_params();
     let mut events = false;
@@ -69,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match flag.as_str() {
             "--days" => days = value.parse()?,
             "--leverage" => leverage = value.parse()?,
-            "--stop" => stop = Some(value.parse()?).filter(|s: &Decimal| !s.is_zero()),
+            "--stop" => stop = Some(value.parse()?),
             "--fee" => fee = value.parse()?,
             "--genome" => {
                 let genes: Vec<f64> = value
@@ -100,6 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let to = Utc::now();
     let candles = agent::candles::fetch_binance("SOLUSDT", Timeframe::M15, fetch_from, to)?;
 
+    if let Some(s) = stop {
+        params.stop_pct = s; // --stop overrides the genome's stop
+    }
+    let stop = Some(params.stop_pct);
     let cfg = SimConfig {
         from,
         to,

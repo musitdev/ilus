@@ -15,22 +15,32 @@
 //!    population with the gain on each training and test period; every
 //!    evaluation goes to `--history` (CSV, default `evolve_history.csv`).
 //!
+//! Cross-validation mode (spec F11): `--months 12 --start 2025-11-01
+//! [--folds 4] [--fold-seed 1] [--trade-exponent 0.5] [--gap-weight 1]`:
+//! every month is simulated; month score = gain / positions^p for a gain,
+//! the loss otherwise; fitness = mean over the folds (6 train / 6 test
+//! months each) of train - gap_weight x |train - test|; `--test` periods are
+//! then a holdout, never used for selection.
+//!
 //! `cargo run --release -p select --example evolve -- [--train 2026-09-01:2026-10-01]...
 //! [--test 2026-06-01:2026-07-01]... [--combine mean|min] [--days 30]
 //! [--candles f.csv] [--save f.csv] [--history h.csv] [--population 10]
 //! [--generations 50] [--elite 2] [--mutation-rate 0.3] [--sigma-min 0.02]
 //! [--sigma-max 0.25] [--crossover 0.7] [--tournament 3] [--patience 10]
-//! [--min-improvement 0.5] [--seed 1] [--leverage 2] [--stop 3] [--fee 0.05]`
+//! [--min-improvement 0.5] [--seed 1] [--leverage 2] [--fee 0.05]` (the
+//! stop-loss is a gene)
 
 use std::fmt::Write as _;
 
 use agent::account::AccountParams;
+use agent::account::EventKind;
 use agent::candles::{fetch_binance, from_csv, to_csv};
 use agent::genome::{AgentParams, GENES, GENOME_LEN};
 use agent::simulate::{SimConfig, SimResult, history_needed, simulate};
-use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use select::score::{Fold, balanced_folds, cross_score, fold_score, period_score};
 use select::{EvolveConfig, Report, Score, evolve};
 use trading::candle::Candle;
 use trading::source::Timeframe;
@@ -85,6 +95,49 @@ fn run(
     simulate(genome, candles, &cfg).map_err(|e| format!("{}: {e}", p.name))
 }
 
+/// Number of positions opened.
+fn positions(r: &SimResult) -> usize {
+    r.account
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Open(_)))
+        .count()
+}
+
+/// Cross-validation settings (`--months`).
+struct Cross {
+    months: Vec<Period>,
+    folds: Vec<Fold>,
+    exponent: f64,
+    gap_weight: Decimal,
+}
+
+/// A simulated month: (result, score).
+type Scored = (Vec<SimResult>, Vec<Decimal>, Decimal);
+
+impl Cross {
+    /// Results and scores of every month, and the fitness (mean of the fold
+    /// scores).
+    fn score(
+        &self,
+        genome: &[f64],
+        candles: &[Candle],
+        a: AccountParams,
+    ) -> Result<Scored, String> {
+        let runs: Vec<SimResult> = self
+            .months
+            .iter()
+            .map(|p| run(genome, candles, p, a))
+            .collect::<Result<_, _>>()?;
+        let scores: Vec<Decimal> = runs
+            .iter()
+            .map(|r| period_score(r.gain_pct(), positions(r), self.exponent))
+            .collect();
+        let fitness = cross_score(&scores, &self.folds, self.gap_weight);
+        Ok((runs, scores, fitness))
+    }
+}
+
 fn genome_text(g: &[f64]) -> String {
     g.iter()
         .map(|x| format!("{x:.4}"))
@@ -136,12 +189,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut days: u64 = 30;
     let (mut train, mut test) = (Vec::<Period>::new(), Vec::<Period>::new());
     let mut combine = Combine::Mean;
+    let (mut months, mut start_month) = (0usize, None::<DateTime<Utc>>);
+    let (mut n_folds, mut fold_seed) = (4usize, 1u64);
+    let (mut exponent, mut gap_weight) = (0.5f64, dec!(1));
     let (mut candles_file, mut save_file) = (None::<String>, None::<String>);
     let mut history_file = "evolve_history.csv".to_string();
     let mut account = AccountParams {
         capital: dec!(1000),
         leverage: dec!(2),
-        stop_pct: Some(dec!(3)),
+        stop_pct: None, // the stop-loss is a gene
         fee_pct: dec!(0.05),
     };
     let mut args = std::env::args().skip(1);
@@ -158,6 +214,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--days" => days = v.parse()?,
+            "--months" => months = v.parse()?,
+            "--start" => start_month = Some(parse_period(&format!("{v}:9999-01-01"))?.from),
+            "--folds" => n_folds = v.parse()?,
+            "--fold-seed" => fold_seed = v.parse()?,
+            "--trade-exponent" => exponent = v.parse()?,
+            "--gap-weight" => gap_weight = v.parse()?,
             "--candles" => candles_file = Some(v),
             "--save" => save_file = Some(v),
             "--history" => history_file = v,
@@ -173,11 +235,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--min-improvement" => cfg.min_improvement = v.parse()?,
             "--seed" => cfg.seed = v.parse()?,
             "--leverage" => account.leverage = v.parse()?,
-            "--stop" => account.stop_pct = Some(v.parse()?).filter(|s: &Decimal| !s.is_zero()),
             "--fee" => account.fee_pct = v.parse()?,
             _ => return Err(format!("unknown option {flag}").into()),
         }
     }
+    // Cross-validation mode: `--months N --start YYYY-MM-01`.
+    let cross = if months > 0 {
+        let start = start_month.ok_or("--months needs --start")?;
+        let mut ms = Vec::new();
+        for k in 0..months {
+            let from = start
+                .checked_add_months(Months::new(k as u32))
+                .ok_or("date")?;
+            let to = from.checked_add_months(Months::new(1)).ok_or("date")?;
+            ms.push(Period {
+                name: from.format("%Y-%m").to_string(),
+                from,
+                to,
+            });
+        }
+        if n_folds == 0 || !n_folds.is_multiple_of(2) {
+            return Err("--folds must be even".into());
+        }
+        let folds = balanced_folds(months, n_folds / 2, fold_seed)?;
+        train = ms.clone();
+        Some(Cross {
+            months: ms,
+            folds,
+            exponent,
+            gap_weight,
+        })
+    } else {
+        None
+    };
     if train.is_empty() {
         let today = Utc::now()
             .date_naive()
@@ -211,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Evolution: {} genomes x {} generations max (elite {}, mutation {} at sigma {}..{}, crossover {}, seed {}), fitness: {:?} gain of the training periods",
+        "Evolution: {} genomes x {} generations max (elite {}, mutation {} at sigma {}..{}, crossover {}, seed {}), fitness: {}",
         cfg.population,
         cfg.generations,
         cfg.elite,
@@ -220,7 +310,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.sigma_max,
         cfg.crossover,
         cfg.seed,
-        combine
+        if cross.is_some() {
+            "cross-validation score".to_string()
+        } else {
+            format!("{combine:?} gain of the training periods")
+        }
     );
     let names = |ps: &[Period]| {
         ps.iter()
@@ -229,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .join(", ")
     };
     println!(
-        "Train: {}; test: {}; {} candles; {}x, stop {}, fee {}%\n",
+        "Train: {}; test: {}; {} candles; {}x, stop-loss {}, fee {}%\n",
         names(&train),
         if test.is_empty() {
             "none".into()
@@ -238,16 +332,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         candles.len(),
         account.leverage.normalize(),
-        account
-            .stop_pct
-            .map_or("none".into(), |s| format!("{}%", s.normalize())),
+        account.stop_pct.map_or("gene".into(), |s| format!(
+            "gene (settings {}% replaced)",
+            s.normalize()
+        )),
         account.fee_pct.normalize()
     );
+
+    if let Some(c) = &cross {
+        println!(
+            "Cross-validation: {} months, {} folds, month score = gain / positions^{} (gains; losses as they are), fold score = train - {} x |train - test|",
+            c.months.len(),
+            c.folds.len(),
+            c.exponent,
+            c.gap_weight
+        );
+        for (k, f) in c.folds.iter().enumerate() {
+            let names = |ids: &[usize]| {
+                ids.iter()
+                    .map(|&i| c.months[i].name.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            println!(
+                "  fold {k}: train {}  |  test {}",
+                names(&f.train),
+                names(&f.test)
+            );
+        }
+        println!();
+    }
 
     let report = evolve(
         GENOME_LEN,
         &cfg,
         |genome: &[f64]| -> Result<Score, String> {
+            if let Some(c) = &cross {
+                let (runs, scores, fitness) = c.score(genome, &candles, account)?;
+                let mut details = Vec::new();
+                for ((p, r), sc) in c.months.iter().zip(&runs).zip(&scores) {
+                    details.push((
+                        format!("gain {}", p.name),
+                        r.gain_pct().round_dp(2).to_string(),
+                    ));
+                    details.push((format!("positions {}", p.name), positions(r).to_string()));
+                    details.push((format!("score {}", p.name), sc.round_dp(2).to_string()));
+                }
+                for (k, f) in c.folds.iter().enumerate() {
+                    details.push((
+                        format!("fold {k}"),
+                        fold_score(&scores, f, c.gap_weight).round_dp(2).to_string(),
+                    ));
+                }
+                return Ok(Score { fitness, details });
+            }
             let mut gains = Vec::new();
             let mut details = Vec::new();
             for p in &train {
@@ -288,11 +426,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Final population (gain % per period; test periods not used for selection):");
     for (rank, s) in report.population.iter().enumerate() {
-        let mut line = format!(
-            "#{rank} fitness {:>7}%  train:",
-            s.score.fitness.round_dp(1)
-        );
-        for p in &train {
+        let mut line = format!("#{rank} fitness {:>7}", s.score.fitness.round_dp(2));
+        if cross.is_none() {
+            line.push_str("  train:");
+        }
+        for p in train.iter().filter(|_| cross.is_none()) {
             let r = run(&s.genome, &candles, p, account)?;
             let _ = write!(
                 line,
@@ -303,7 +441,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         if !test.is_empty() {
-            line.push_str("  test:");
+            line.push_str(if cross.is_some() {
+                "  holdout:"
+            } else {
+                "  test:"
+            });
             for p in &test {
                 let r = run(&s.genome, &candles, p, account)?;
                 let _ = write!(
@@ -316,6 +458,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!("{line}");
+        if let Some(c) = &cross {
+            let (runs, scores, _) = c.score(&s.genome, &candles, account)?;
+            let months: Vec<String> = c
+                .months
+                .iter()
+                .zip(&runs)
+                .map(|(p, r)| {
+                    format!(
+                        "{} {:+}% ({}p)",
+                        &p.name[2..],
+                        r.gain_pct().round_dp(1),
+                        positions(r)
+                    )
+                })
+                .collect();
+            println!("   months: {}", months.join(", "));
+            let folds: Vec<String> = c
+                .folds
+                .iter()
+                .map(|f| fold_score(&scores, f, c.gap_weight).round_dp(1).to_string())
+                .collect();
+            println!("   fold scores: {}", folds.join(", "));
+        }
         println!("   {}", AgentParams::decode(&s.genome)?);
         println!("   --genome {}", genome_text(&s.genome));
     }

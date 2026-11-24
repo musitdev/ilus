@@ -687,7 +687,7 @@ A trading agent combines several **rules**. Each rule is an ordinary chain of th
 
 Crate `agent`. The evolutionary algorithm calls `simulate(genome, candles, config)` to get the **fitness** of a genome: the **gain in %** of a simulated futures account traded by the agent of that genome.
 
-**Genome**: a vector of `GENOME_LEN` (25) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
+**Genome**: a vector of `GENOME_LEN` (26) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
 
 | Genes | Range (step) |
 |---|---|
@@ -695,6 +695,7 @@ Crate `agent`. The evolutionary algorithm calls `simulate(genome, candles, confi
 | open threshold, exit threshold | 0.25 – 10 (0.25) |
 | per divergence (15m, 1h): RSI low, RSI high, lookahead, RSI exit high, RSI exit low | 20 – 50, 50 – 80, 1 – 6, 60 – 90, 10 – 40 (1) |
 | EMA fast period; slow = fast + gap; trend EMA period | 5 – 50, gap 1 – 150, 20 – 300 (1) |
+| stop-loss % of the entry price (replaces the one of the settings) | 1 – 10 (0.5) |
 
 Fixed (not genes): RSI 14, pivots `left` / `right` 3, divergence `min_gap` 2 candles of its timeframe, the default pattern thresholds.
 
@@ -729,8 +730,16 @@ Crate `select`. `evolve(len, config, fitness)` runs a genetic algorithm on genom
 
 Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 – 0.25, crossover 0.7, tournament 3, patience 10, min improvement 0.5, seed 1.
 
+**Cross-validation score** (`select::score`, used by `evolve --months`):
+- **Month score**: `gain / positions^p` when the month gains (`p` = `--trade-exponent`, default 0.5: few trades that gain score more), the gain itself when it loses (many losing trades do not soften the loss), 0 without any position.
+- **Folds**: `--folds` (4) splits of the `--months` (12) months into 6 train / 6 test months, built in pairs (A/B then B/A, two different shuffles, seeded by `--fold-seed`): each month is a training month in exactly half of the folds, and the training sets differ.
+- **Fold score**: `mean(train) − gap_weight × |mean(train) − mean(test)|` (`--gap-weight`, default 1): the difference between the training and test months is minimised.
+- **Fitness**: the mean of the fold scores. Every month is used by the fitness; `--test` periods are then a **holdout**, never used for selection.
+
 **Example `evolve`**: SOL/USDT 15m.
 - Periods: `--train FROM:TO` (repeatable): the fitness is the **mean** (`--combine mean`, default) or the **worst** (`--combine min`) of the gains on the training periods (e.g. a bull and a bear month); `--test FROM:TO` (repeatable): only measured on the final population, never used for selection. Without `--train`: the last `--days` (30) days.
+- Cross-validation mode: `--months N --start YYYY-MM-01` (one period per calendar month), with the score above.
+- The stop-loss is a gene (F10); the account settings are the leverage and the fee.
 - Candles: every period plus the longest warm-up any genome can need, fetched once from Binance (or `--candles file.csv`, saved with `--save`).
 - Prints the best and mean fitness of each generation and the final population (fitness, gain / events / stops on each training and test period, parameters, `--genome` line for `backtest_agent`); writes the history to a CSV file (`--history`: one line per genome and generation, with the gain, events and stops of each training period, the genes and the decoded parameters).
 

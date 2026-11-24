@@ -145,7 +145,7 @@ Key properties:
   clears every ballot after a decision. Weights, thresholds and rule
   parameters are the genes of a later selection algorithm.
 - **Agent simulation** (crate `agent`, `simulate`): the fitness of a genome
-  (25 genes in [0, 1] decoded into the agent's parameters): the agent runs on
+  (26 genes in [0, 1] decoded into the agent's parameters): the agent runs on
   15m candles given in memory and trades a simulated futures account
   (`account::Account`); the result is the gain in %, with every trade event.
 - **Evolution** (crate `select`, `evolve`): genetic algorithm on genomes with
@@ -311,26 +311,33 @@ simulated futures account. Hand-written parameters, or any genome with
 `--genome`:
 
 ```sh
-cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g25] [--events]
+cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g26] [--events]
 ```
 
 **`evolve`** (crate `select`): evolves agent genomes on SOL/USDT 15m, on
 training periods (`--train FROM:TO`, repeatable, e.g. a bull and a bear
 month; fitness: mean or worst gain with `--combine mean|min`; default: the
 last month), and measures the final population on test periods never used
-for selection (`--test FROM:TO`); candles fetched once (`--candles` /
+for selection (`--test FROM:TO`). Cross-validation mode: `--months 12
+--start 2025-11-01` simulates every month and scores the genome over 4
+train / test splits (`--folds`), the month score dividing a gain by
+positions^0.5 (`--trade-exponent`) and the fold score subtracting the
+train / test gap (`--gap-weight`); `--test` is then a holdout. The stop-loss
+is a gene. Candles are fetched once (`--candles` /
 `--save` to reuse a CSV);
 prints the best and mean gain per generation and the final population with
 `--genome` lines for `backtest_agent`; every evaluation goes to a history CSV
 (`--history`, default `evolve_history.csv`). All the algorithm settings are
 options (population, generations, elite, mutation rate, sigma min / max,
 crossover, tournament, patience, min improvement, seed), as are the account
-settings (leverage, stop, fee):
+settings (leverage, fee):
 
 ```sh
 cargo run --release -p select --example evolve -- \
   --train 2026-09-01:2026-10-01 --train 2026-10-01:2026-11-01 \
   --test 2026-06-01:2026-07-01 --test 2026-07-01:2026-08-01 --combine mean --save data.csv
+cargo run --release -p select --example evolve -- \
+  --months 12 --start 2025-11-01 --test 2026-11-01:2026-11-24 --save year.csv
 ```
 
 ### Chart window
@@ -431,7 +438,7 @@ crates/agent/              the multi-rule agent
   src/voters.rs         one voter condition per rule
   src/account.rs        simulated futures account
   src/candles.rs        candles: fetch from Binance once, CSV read / write
-  src/genome.rs         genome (25 genes) <-> AgentParams
+  src/genome.rs         genome (26 genes) <-> AgentParams
   src/simulate.rs       simulate: the fitness of a genome
   examples/backtest_agent.rs  test agent on the futures simulation
   tests/agent.rs        votes triggering the decision in the same tick

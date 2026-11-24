@@ -57,7 +57,7 @@ pub struct SimConfig {
     pub from: DateTime<Utc>,
     /// End of the simulation (excluded).
     pub to: DateTime<Utc>,
-    /// The account.
+    /// The account (its `stop_pct` is replaced by the genome's).
     pub account: AccountParams,
 }
 
@@ -157,7 +157,12 @@ pub fn simulate_params(
     if cfg.from >= cfg.to {
         return Err(invalid("from must be before to"));
     }
-    let account = Account::new(cfg.account).map_err(invalid)?;
+    // The stop-loss is a gene: it replaces the one of the settings.
+    let account = Account::new(AccountParams {
+        stop_pct: Some(params.stop_pct),
+        ..cfg.account
+    })
+    .map_err(invalid)?;
     let before = candles
         .iter()
         .take_while(|c| c.open_time < cfg.from)
