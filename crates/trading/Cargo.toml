@@ -1,0 +1,37 @@
+[package]
+name = "trading"
+description = "ilus trading engine: sources, transformers, conditions, actions, graph executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+eframe = { version = "0.37.0", optional = true }
+egui_plot = { version = "0.38.0", optional = true }
+reqwest = { version = "0.13", features = ["query"] }
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time"] }
+
+[[example]]
+name = "chart_futures"
+required-features = ["chart"]
+
+[[example]]
+name = "chart_patterns"
+required-features = ["chart"]
+
+[[example]]
+name = "chart_signals"
+required-features = ["chart"]
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+tokio = { version = "1.54.1", features = ["test-util", "rt", "macros"] }
+
+[features]
+# Native chart window (transformer::chart).
+chart = ["dep:eframe", "dep:egui_plot"]

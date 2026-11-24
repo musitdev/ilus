@@ -1,0 +1,10 @@
+[package]
+name = "select"
+description = "ilus selection: evolutionary search of agent genomes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent.workspace = true
+trading.workspace = true

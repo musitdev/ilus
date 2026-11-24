@@ -44,13 +44,13 @@ jobs:
       - name: Feature flags
         run: |
           if [ "${{ matrix.features }}" = chart ]; then
-            echo "FEATURES=--features chart" >> "$GITHUB_ENV"
+            echo "FEATURES=--features trading/chart" >> "$GITHUB_ENV"
           else
             echo "FEATURES=" >> "$GITHUB_ENV"
           fi
       - name: Build
-        run: cargo build --all-targets $FEATURES
+        run: cargo build --workspace --all-targets $FEATURES
       - name: Clippy
-        run: cargo clippy --all-targets $FEATURES -- -D warnings
+        run: cargo clippy --workspace --all-targets $FEATURES -- -D warnings
       - name: Test
-        run: cargo test $FEATURES
+        run: cargo test --workspace $FEATURES

@@ -17,12 +17,17 @@ Guidance for AI coding agents working on **ilus**.
 
 ## Commands
 ```sh
-cargo build
-cargo test
+cargo build --workspace --all-targets
+cargo test --workspace                     # also with --features trading/chart
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings   # also with --features trading/chart
 ```
-All four must pass before a change is considered done.
+All four must pass before a change is considered done (CI runs them on every
+pull request).
+
+## Layout
+Cargo workspace, crates in `crates/`: `trading` (engine), `agent`
+(multi-rule agent), `select` (evolutionary search). See SPECS.md §1.
 
 ## Conventions
 - Formatting: `rustfmt` defaults.

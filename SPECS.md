@@ -7,7 +7,21 @@ ilus is a market-monitoring bot that fetches market data from **sources**, detec
 
 Two extra concepts make the pipeline flexible: **transformers** derive new sources from existing ones (e.g. an RSI source computed from a price source), and **modifiers** let an action send information back to a condition to change how it operates.
 
-ilus is **not a trading-strategy engine**. It does not model strategies in terms of buy/sell signals, positions, or portfolio management. Its core abstraction is generic: *condition → action*. Placing an order is just one possible action among others (e.g. sending a notification, logging, calling a webhook).
+The **engine** (crate `trading`) is not a trading-strategy engine: it does not model strategies in terms of buy/sell signals, positions, or portfolio management. Its core abstraction is generic: *condition → action*. Placing an order is just one possible action among others (e.g. sending a notification, logging, calling a webhook).
+
+**Project goal.** Find agents that trade well, to train a deep network that will trade in the end:
+1. A multi-rule **agent** (F9) is defined by its **genome**: the parameters of its rules, their weights and the decision thresholds.
+2. An **evolutionary algorithm** searches genomes and keeps the agents that trade well (on simulated futures).
+3. Many good agents generate training data: the candles and their **buy / sell events**.
+4. A **deep network** is trained on that data, then used to trade. *(Later; not specified yet.)*
+
+**Crates** (Cargo workspace, `crates/`):
+
+| Crate | Content |
+|---|---|
+| `trading` | the engine: graph, executor, sources, transformers, conditions, actions, modifiers, chart (feature `chart`) |
+| `agent` | the multi-rule agent: voters, `SendVotes`, `Decision` (F9) |
+| `select` | the evolutionary search of agent genomes (not implemented yet) |
 
 ## 2. Goals
 - Fetch market data through pluggable **sources**. A default source is provided: a free, public crypto price/volume feed with 1-minute precision.

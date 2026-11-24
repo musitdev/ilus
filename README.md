@@ -136,7 +136,7 @@ Key properties:
     direction pass (EMA rule 3).
   - `Projected`: runs a condition on a part of its input, once per new part
     (e.g. a 1h divergence on candles aggregated from 15m).
-- **Multi-rule agent** (`agent`): each rule is a chain ending with a *voter*
+- **Multi-rule agent** (crate `agent`): each rule is a chain ending with a *voter*
   condition (`DivergenceVoter`, `EmaCrossVoter`, `TrendVoter`,
   `PatternVoter`) that emits open / revoke / exit ballots; its `SendVotes`
   action sends them, with the rule's weights, as modifiers to one `Decision`
@@ -160,20 +160,20 @@ The Binance examples need internet access. The chart example needs a desktop
 session (X11 or Wayland).
 
 ```sh
-cargo build
-cargo test
+cargo build --workspace
+cargo test --workspace
 ```
 
 ### Minimal graph
 
 ```rust
-use ilus::action::Alert;
-use ilus::condition::divergence::{DivergenceParams, RsiDivergence};
-use ilus::executor::Executor;
-use ilus::graph::Graph;
-use ilus::source::Timeframe;
-use ilus::source::binance::BinanceSource;
-use ilus::transformer::rsi::Rsi;
+use trading::action::Alert;
+use trading::condition::divergence::{DivergenceParams, RsiDivergence};
+use trading::executor::Executor;
+use trading::graph::Graph;
+use trading::source::Timeframe;
+use trading::source::binance::BinanceSource;
+use trading::transformer::rsi::Rsi;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
@@ -360,46 +360,54 @@ cargo run --features chart --example chart_signals -- 2 15m
 
 ## Project layout
 
+Cargo workspace; the crates are in `crates/` (see SPECS.md §1 for the
+project goal):
+
 ```text
-src/
-  lib.rs              crate overview
-  graph.rs            Graph builder (typed handles), nodes
-  executor.rs         Executor (ticks), Clock
-  source.rs           Source trait, Mode, Item, Timeframe, aligned schedule
-  source/binance.rs   Binance source (REST)
-  source/merge.rs     merge source (two timeframes)
-  source/mock.rs      mock source
-  candle.rs           Candle (OHLCV)
-  transformer.rs      Transformer trait, Derived
-  transformer/rsi.rs  RSI transformer
-  transformer/ema.rs  EMA transformer
-  transformer/macd.rs MACD transformer
-  transformer/aggregate.rs  aggregation (1m -> 5m, ...)
-  transformer/combine.rs    combined transformer and adapters
-  transformer/trend.rs      trend (close vs EMA)
-  transformer/chart.rs chart transformer + window (feature `chart`)
-  condition.rs        Condition trait
-  condition/divergence.rs  RSI divergence condition
-  condition/patterns.rs    candlestick pattern condition (13 patterns)
-  condition/ema_rules.rs   EMA buy / sell rules
-  condition/filter.rs      trend filter
-  condition/projected.rs   condition on a part of the input (other timeframe)
-  agent.rs            ballots, votes, SendVotes action
-  agent/decision.rs   decision condition (weighted votes)
-  agent/voters.rs     one voter condition per rule
-  trigger.rs          Detection, TriggerEvent
-  action.rs           Action trait, ActionContext, Alert
-  modifier.rs         modifiers and handles
-  error.rs            error types
-examples/             runnable examples (see above)
-  common/             helpers for the flow_* examples and simple
-  support/futures.rs  futures simulation shared by backtest_futures and chart_futures
-tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
-tests/trend_filter.rs trend filter in a graph
-tests/agent.rs        votes triggering the decision in the same tick
-tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
-                      against an independent computation
-tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
+Cargo.toml                 workspace
+crates/trading/            the engine (lib name `trading`)
+  src/
+    lib.rs              crate overview
+    graph.rs            Graph builder (typed handles), nodes
+    executor.rs         Executor (ticks), Clock
+    source.rs           Source trait, Mode, Item, Timeframe, aligned schedule
+    source/binance.rs   Binance source (REST)
+    source/merge.rs     merge source (two timeframes)
+    source/mock.rs      mock source
+    candle.rs           Candle (OHLCV)
+    transformer.rs      Transformer trait, Derived
+    transformer/rsi.rs  RSI transformer
+    transformer/ema.rs  EMA transformer
+    transformer/macd.rs MACD transformer
+    transformer/aggregate.rs  aggregation (1m -> 5m, ...)
+    transformer/combine.rs    combined transformer and adapters
+    transformer/trend.rs      trend (close vs EMA)
+    transformer/chart.rs chart transformer + window (feature `chart`)
+    condition.rs        Condition trait
+    condition/divergence.rs  RSI divergence condition
+    condition/patterns.rs    candlestick pattern condition (13 patterns)
+    condition/ema_rules.rs   EMA buy / sell rules
+    condition/filter.rs      trend filter
+    condition/projected.rs   condition on a part of the input (other timeframe)
+    trigger.rs          Detection, TriggerEvent
+    action.rs           Action trait, ActionContext, Alert
+    modifier.rs         modifiers and handles
+    error.rs            error types
+  examples/             runnable examples (see above)
+    common/             helpers for the flow_* examples and simple
+    support/futures.rs  futures simulation (backtest_futures, chart_futures, backtest_agent)
+  tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
+  tests/trend_filter.rs trend filter in a graph
+crates/agent/              the multi-rule agent
+  src/lib.rs            ballots, votes, SendVotes action
+  src/decision.rs       decision condition (weighted votes)
+  src/voters.rs         one voter condition per rule
+  examples/backtest_agent.rs  test agent on the futures simulation
+  tests/agent.rs        votes triggering the decision in the same tick
+  tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
+                        against an independent computation
+  tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
+crates/select/             evolutionary search of agent genomes (not implemented yet)
 ```
 
 ---
@@ -409,10 +417,10 @@ tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
 All four commands must pass before a change is done:
 
 ```sh
-cargo build
-cargo test                      # add --features chart to include the chart tests
+cargo build --workspace --all-targets
+cargo test --workspace                     # add --features trading/chart for the chart tests
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings   # also with --features chart
+cargo clippy --workspace --all-targets -- -D warnings   # also with --features trading/chart
 ```
 
 Automated tests never use the network: they use `MockSource`, hand-made
