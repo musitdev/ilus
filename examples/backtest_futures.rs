@@ -29,6 +29,10 @@
 //!   `--rsi-low R` / `--rsi-high R`: RSI level of the first low / high
 //!   (default 30 / 70; 100 / 0 for any level); `--lookahead N`: pivots in which
 //!   the diverging one is searched (default 3);
+//! - RSI exit (`--exit-rsi-high R` / `--exit-rsi-low R`, default 75 / 30): a
+//!   long closes at the first high pivot after entry with RSI above R, a short
+//!   at the first low pivot with RSI below R, at the close of the candle that
+//!   confirms the pivot; the account then stays flat until the next divergence;
 //! - funding rates are ignored.
 //!
 //! The condition is wrapped so that it also emits a "tick" event for every
@@ -45,7 +49,6 @@
 mod futures;
 
 use futures::{Futures, WithTicks, parse_args};
-use ilus::condition::divergence::RsiDivergence;
 use ilus::executor::Executor;
 use ilus::graph::Graph;
 use ilus::source::binance::BinanceSource;
@@ -59,14 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
     let sol = g.source(BinanceSource::new("SOLUSDT", args.timeframe).replay(args.from, args.to));
     let sol_rsi = g.transform(Rsi::new(14)?, &sol);
-    let signals = g.condition(
-        "sol-divergence",
-        WithTicks(RsiDivergence::new(args.params)?),
-        &sol_rsi,
-    );
+    let signals = g.condition("sol-divergence", WithTicks::new(args.params)?, &sol_rsi);
     for &fee in &args.fees {
         g.action(
-            Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ()),
+            Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ())
+                .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1),
             &signals,
         );
     }

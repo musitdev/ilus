@@ -609,6 +609,10 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 - A pullback requires the previous close on the trend side of the short EMA, which excludes breakouts.
 - Rule 3 (trend filter: only buys above a long EMA) is not a signal but a filter on other signals: not implemented yet.
 
+**Price pivots** (`Pivots`, used by the divergence condition and by the futures simulation): a candle whose low (high) is strictly beyond the `left` candles before it and at least as far as the `right` candles after it, confirmed `right` candles later, with its RSI.
+
+**RSI exit** (futures simulation example): a long closes at the first **high** pivot after entry whose RSI is **above** `exit_rsi_high` (default 75); a short at the first **low** pivot whose RSI is **below** `exit_rsi_low` (default 30); at the close of the candle confirming the pivot. The stop-loss and the opposite divergence stay; the first one closes the position. After an RSI exit, the account is flat until the next divergence.
+
 **Acceptance criteria:**
 - [ ] EMA and MACD values match hand-computed sequences.
 - [ ] Each rule: a buy case, a sell case and a no-signal case; a cross triggers once per cross.

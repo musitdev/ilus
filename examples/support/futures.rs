@@ -11,7 +11,9 @@ use chrono::{DateTime, Utc};
 use ilus::action::{Action, ActionContext};
 use ilus::candle::Candle;
 use ilus::condition::Condition;
-use ilus::condition::divergence::{Divergence, DivergenceKind, DivergenceParams, RsiDivergence};
+use ilus::condition::divergence::{
+    ConfirmedPivots, Divergence, DivergenceKind, DivergenceParams, Pivots, RsiDivergence,
+};
 use ilus::error::{ActionError, ModifierError};
 use ilus::modifier::NoModifier;
 use ilus::source::{Item, Timeframe};
@@ -24,17 +26,31 @@ const MAINTENANCE: Decimal = Decimal::from_parts(5, 0, 0, false, 3); // 0.005
 
 // ---------------------------------------------------------------- condition
 
-/// Value emitted by [`WithTicks`]: a plain candle, or a divergence.
+/// Value emitted by [`WithTicks`] for every candle: the divergence it
+/// confirms, if any, and the price pivots it confirms (for the RSI exits).
 #[derive(Debug)]
-pub enum Signal {
-    Tick,
-    Divergence(Divergence),
+pub struct Signal {
+    pub divergence: Option<Divergence>,
+    pub pivots: ConfirmedPivots,
 }
 impl TriggerValue for Signal {}
 
-/// Wraps [`RsiDivergence`] and also emits an event for every candle
-/// (the action needs every candle to check stops and liquidation).
-pub struct WithTicks(pub RsiDivergence);
+/// Wraps [`RsiDivergence`] and emits an event for every candle (the action
+/// needs every candle to check stops, liquidation and RSI exits).
+pub struct WithTicks {
+    divergence: RsiDivergence,
+    pivots: Pivots,
+}
+
+impl WithTicks {
+    /// Divergences with `params`; pivots with the same `left` / `right`.
+    pub fn new(params: DivergenceParams) -> Result<Self, ilus::error::ParameterError> {
+        Ok(Self {
+            divergence: RsiDivergence::new(params)?,
+            pivots: Pivots::new(params.left, params.right),
+        })
+    }
+}
 
 impl Condition for WithTicks {
     type Input = RsiCandle;
@@ -42,18 +58,20 @@ impl Condition for WithTicks {
     type Modifier = NoModifier;
 
     fn warm_up(&self) -> usize {
-        self.0.warm_up()
+        self.divergence.warm_up()
     }
 
     fn on_data(&mut self, item: Item<'_, RsiCandle>) -> Option<Detection<Signal>> {
-        Some(match self.0.on_data(item) {
-            Some(d) => Detection {
-                event_type: d.event_type,
-                value: Signal::Divergence(d.value),
-            },
-            None => Detection {
-                event_type: TriggerEventType::Other("tick"),
-                value: Signal::Tick,
+        let pivots = self.pivots.push(item.data);
+        let detection = self.divergence.on_data(item);
+        let event_type = detection
+            .as_ref()
+            .map_or(TriggerEventType::Other("tick"), |d| d.event_type);
+        Some(Detection {
+            event_type,
+            value: Signal {
+                divergence: detection.map(|d| d.value),
+                pivots,
             },
         })
     }
@@ -80,6 +98,8 @@ pub enum TradeKind {
     Open(Side),
     Close,
     Stop,
+    /// Closed by the RSI exit rule.
+    RsiExit,
     Liquidation,
 }
 
@@ -133,6 +153,10 @@ pub struct Futures<R: TradeRecorder = ()> {
     /// Stop-loss as a fraction of the entry price (0.03 = 3 %), if any.
     stop: Option<Decimal>,
     stops: u32,
+    /// RSI exit levels: a long closes at the first high pivot with RSI
+    /// above `high`, a short at the first low pivot with RSI below `low`.
+    exit_rsi: Option<(Decimal, Decimal)>,
+    rsi_exits: u32,
     fee: Decimal,
     /// Equity in USDT when flat (set at the first candle).
     equity: Option<Decimal>,
@@ -169,6 +193,8 @@ impl<R: TradeRecorder> Futures<R> {
             leverage,
             stop: stop_pct.map(|p| p / Decimal::ONE_HUNDRED),
             stops: 0,
+            exit_rsi: None,
+            rsi_exits: 0,
             fee: fee_pct / Decimal::ONE_HUNDRED,
             equity: None,
             start_equity: Decimal::ZERO,
@@ -185,6 +211,40 @@ impl<R: TradeRecorder> Futures<R> {
                 stop_pct.map_or("none".to_string(), |p| format!("{}%", p.normalize())),
                 fee_pct.normalize()
             ),
+        }
+    }
+
+    /// RSI exit: a long closes at the first high pivot after entry with RSI
+    /// above `high` (e.g. 75), a short at the first low pivot with RSI below
+    /// `low` (e.g. 30), at the close of the candle confirming the pivot.
+    pub fn with_rsi_exit(mut self, high: Decimal, low: Decimal) -> Self {
+        self.exit_rsi = Some((high, low));
+        let _ = writeln!(
+            self.log,
+            "RSI exit: long at a high with RSI > {high}, short at a low with RSI < {low}"
+        );
+        self
+    }
+
+    /// Close the position if the candle confirms an RSI exit pivot.
+    fn check_rsi_exit(&mut self, when: &str, pivots: &ConfirmedPivots, close: Decimal) {
+        let (Some(p), Some((high, low))) = (self.position, self.exit_rsi) else {
+            return;
+        };
+        let exit = match p.side {
+            Side::Long => pivots.high.filter(|h| h.rsi > high),
+            Side::Short => pivots.low.filter(|l| l.rsi < low),
+        };
+        if let Some(pivot) = exit {
+            self.rsi_exits += 1;
+            let _ = writeln!(
+                self.log,
+                "{when}  RSI EXIT {:?} (pivot {} rsi {})",
+                p.side,
+                pivot.time.format("%m-%d %H:%M"),
+                pivot.rsi.round_dp(2)
+            );
+            self.close(when, close, TradeKind::RsiExit);
         }
     }
 
@@ -278,10 +338,10 @@ impl<R: TradeRecorder> Futures<R> {
         );
         let label = format!(
             "{} {:+}%",
-            if kind == TradeKind::Stop {
-                "stop"
-            } else {
-                "close"
+            match kind {
+                TradeKind::Stop => "stop",
+                TradeKind::RsiExit => "RSI exit",
+                _ => "close",
             },
             self.pct(equity)
         );
@@ -352,8 +412,9 @@ impl<R: TradeRecorder> Futures<R> {
         if self.position.is_none() && self.equity == Some(Decimal::ZERO) {
             return; // no equity left
         }
+        self.check_rsi_exit(&when, &value.pivots, c.close);
 
-        let Signal::Divergence(d) = value else {
+        let Some(d) = &value.divergence else {
             return;
         };
         let (target, opposite) = match d.kind {
@@ -409,9 +470,10 @@ impl<R: TradeRecorder> Drop for Futures<R> {
         let now = self.mark(self.last_price);
         let _ = writeln!(
             out,
-            "=== Summary: {} transactions, {} stops, {} liquidations, fees paid {} USDT, lowest equity {} USDT",
+            "=== Summary: {} transactions, {} stops, {} RSI exits, {} liquidations, fees paid {} USDT, lowest equity {} USDT",
             self.trades,
             self.stops,
+            self.rsi_exits,
             self.liquidations,
             self.fees_paid.round_dp(2),
             self.min_equity.round_dp(2)
@@ -456,6 +518,8 @@ pub struct Args {
     pub fees: Vec<Decimal>,
     /// Global tick of the replay (`--tick-ms`, default 0: as fast as possible).
     pub tick: Duration,
+    /// RSI exit levels (`--exit-rsi-high`, `--exit-rsi-low`; default 75 / 30).
+    pub exit_rsi: (Decimal, Decimal),
     /// Description of the run.
     pub header: String,
 }
@@ -470,6 +534,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut to_date: Option<chrono::NaiveDate> = None;
     let mut leverage = Decimal::from(10);
     let mut tick = Duration::ZERO;
+    let mut exit_rsi = (Decimal::from(75), Decimal::from(30));
     let mut stop: Option<Decimal> = None;
     // Pivot options; the gaps are given in candles and converted below.
     let (mut left, mut right) = (None::<usize>, None::<usize>);
@@ -520,6 +585,14 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                         .parse()
                         .map_err(|e| format!("invalid --min-gap: {e}"))?,
                 )
+            }
+            "--exit-rsi-high" => {
+                exit_rsi.0 = Decimal::from_str(&value)
+                    .map_err(|e| format!("invalid --exit-rsi-high: {e}"))?
+            }
+            "--exit-rsi-low" => {
+                exit_rsi.1 =
+                    Decimal::from_str(&value).map_err(|e| format!("invalid --exit-rsi-low: {e}"))?
             }
             "--rsi-low" => {
                 rsi_low =
@@ -581,7 +654,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         return Err("the start must be before the end".into());
     }
     let header = format!(
-        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, from {} to {} (UTC)\n",
+        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, RSI exit {} / {}, from {} to {} (UTC)\n",
         leverage.normalize(),
         stop.map_or("none".to_string(), |p| format!("{}%", p.normalize())),
         params.left,
@@ -590,6 +663,8 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         params.rsi_low,
         params.rsi_high,
         params.lookahead,
+        exit_rsi.0,
+        exit_rsi.1,
         fmt_time(from),
         fmt_time(now)
     );
@@ -603,6 +678,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         params,
         fees,
         tick,
+        exit_rsi,
         header,
     })
 }

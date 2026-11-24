@@ -132,12 +132,99 @@ struct Bar {
     rsi: Option<Decimal>,
 }
 
+/// Pivots confirmed by the last candle (at most one of each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfirmedPivots {
+    /// A price minimum (its low), with its RSI.
+    pub low: Option<Pivot>,
+    /// A price maximum (its high), with its RSI.
+    pub high: Option<Pivot>,
+}
+
+/// Detects price pivots on candles with RSI: a candle whose low (high) is
+/// strictly beyond the `left` candles before it and at least as far as the
+/// `right` candles after it. A pivot is confirmed `right` candles later.
+/// Candles without RSI (warm-up) give no pivot.
+#[derive(Debug, Clone)]
+pub struct Pivots {
+    left: usize,
+    right: usize,
+    /// The last `left + 1 + right` candles; the candidate pivot is at `left`.
+    window: VecDeque<Bar>,
+}
+
+impl Pivots {
+    /// Pivots with `left` / `right` candles around them (at least 1).
+    pub fn new(left: usize, right: usize) -> Self {
+        let (left, right) = (left.max(1), right.max(1));
+        Self {
+            left,
+            right,
+            window: VecDeque::with_capacity(left + right + 2),
+        }
+    }
+
+    /// Candles needed before the first pivot.
+    pub fn warm_up(&self) -> usize {
+        self.left + 1 + self.right
+    }
+
+    /// Add a closed candle; returns the pivots it confirms.
+    pub fn push(&mut self, item: &RsiCandle) -> ConfirmedPivots {
+        let c = &item.data;
+        self.window.push_back(Bar {
+            time: c.open_time,
+            low: c.low,
+            high: c.high,
+            rsi: item.value,
+        });
+        if self.window.len() > self.warm_up() {
+            self.window.pop_front();
+        }
+        if self.window.len() < self.warm_up() {
+            return ConfirmedPivots::default();
+        }
+        let candidate = self.window[self.left];
+        let Some(rsi) = candidate.rsi else {
+            return ConfirmedPivots::default();
+        };
+        let pivot = |price| Pivot {
+            time: candidate.time,
+            price,
+            rsi,
+        };
+        ConfirmedPivots {
+            low: self
+                .is_pivot(|b| b.low, |a, b| a < b)
+                .then(|| pivot(candidate.low)),
+            high: self
+                .is_pivot(|b| b.high, |a, b| a > b)
+                .then(|| pivot(candidate.high)),
+        }
+    }
+
+    /// Is the candidate (at `left`) a pivot for `key`? `beyond(a, b)` means
+    /// "a is strictly beyond b" (lower for minima, higher for maxima).
+    /// Strict on the left side, non-strict on the right side.
+    fn is_pivot(&self, key: fn(&Bar) -> Decimal, beyond: fn(Decimal, Decimal) -> bool) -> bool {
+        let left = self.left;
+        let v = key(&self.window[left]);
+        self.window
+            .iter()
+            .enumerate()
+            .all(|(i, bar)| match i.cmp(&left) {
+                Ordering::Less => beyond(v, key(bar)),
+                Ordering::Equal => true,
+                Ordering::Greater => !beyond(key(bar), v),
+            })
+    }
+}
+
 /// Detects bullish and bearish RSI divergences.
 #[derive(Debug, Clone)]
 pub struct RsiDivergence {
     params: DivergenceParams,
-    /// The last `left + 1 + right` candles; the candidate pivot is at `left`.
-    window: VecDeque<Bar>,
+    pivots: Pivots,
     lows: Search,
     highs: Search,
 }
@@ -166,26 +253,10 @@ impl RsiDivergence {
     fn unchecked(params: DivergenceParams) -> Self {
         Self {
             params,
-            window: VecDeque::with_capacity(params.left + params.right + 2),
+            pivots: Pivots::new(params.left, params.right),
             lows: Search::default(),
             highs: Search::default(),
         }
-    }
-
-    /// Is the candidate (at `left`) a pivot for `key`? `beyond(a, b)` means
-    /// "a is strictly beyond b" (lower for minima, higher for maxima).
-    /// Strict on the left side, non-strict on the right side.
-    fn is_pivot(&self, key: fn(&Bar) -> Decimal, beyond: fn(Decimal, Decimal) -> bool) -> bool {
-        let left = self.params.left;
-        let v = key(&self.window[left]);
-        self.window
-            .iter()
-            .enumerate()
-            .all(|(i, bar)| match i.cmp(&left) {
-                Ordering::Less => beyond(v, key(bar)),
-                Ordering::Equal => true,
-                Ordering::Greater => !beyond(key(bar), v),
-            })
     }
 
     /// A new pivot `b` on the side `kind` (lows: bullish, highs: bearish).
@@ -257,53 +328,17 @@ impl Condition for RsiDivergence {
     }
 
     fn on_data(&mut self, item: Item<'_, RsiCandle>) -> Option<Detection<Divergence>> {
-        let item = item.data;
-        let c = &item.data;
-        self.window.push_back(Bar {
-            time: c.open_time,
-            low: c.low,
-            high: c.high,
-            rsi: item.value,
+        let confirmed_at = item.data.data.open_time;
+        let pivots = self.pivots.push(item.data);
+        let bullish = pivots.low.and_then(|b| {
+            self.on_pivot(b, DivergenceKind::Bullish)
+                .map(|(a, b)| (DivergenceKind::Bullish, a, b))
         });
-        let size = self.params.left + 1 + self.params.right;
-        if self.window.len() > size {
-            self.window.pop_front();
-        }
-        if self.window.len() < size {
-            return None;
-        }
-
-        // The candidate is confirmed by the candle that just closed.
-        let candidate = self.window[self.params.left];
-        let confirmed_at = c.open_time;
-        let mut detection = None;
-
-        if self.is_pivot(|b| b.low, |a, b| a < b)
-            && let Some(rsi) = candidate.rsi
-        {
-            let b = Pivot {
-                time: candidate.time,
-                price: candidate.low,
-                rsi,
-            };
-            detection = self
-                .on_pivot(b, DivergenceKind::Bullish)
-                .map(|(a, b)| (DivergenceKind::Bullish, a, b));
-        }
-
-        if self.is_pivot(|b| b.high, |a, b| a > b)
-            && let Some(rsi) = candidate.rsi
-        {
-            let b = Pivot {
-                time: candidate.time,
-                price: candidate.high,
-                rsi,
-            };
-            let bearish = self
-                .on_pivot(b, DivergenceKind::Bearish)
-                .map(|(a, b)| (DivergenceKind::Bearish, a, b));
-            detection = detection.or(bearish);
-        }
+        let bearish = pivots.high.and_then(|b| {
+            self.on_pivot(b, DivergenceKind::Bearish)
+                .map(|(a, b)| (DivergenceKind::Bearish, a, b))
+        });
+        let detection = bullish.or(bearish);
 
         detection.map(|(kind, first, second)| Detection {
             event_type: match kind {
@@ -551,5 +586,31 @@ mod tests {
             assert!(RsiDivergence::new(b).is_err(), "{b:?}");
         }
         assert!(RsiDivergence::new(p).is_ok());
+    }
+
+    #[test]
+    fn pivots_are_confirmed_right_candles_later() {
+        // One valley (low 100, RSI 25): the low pivot is confirmed 2 candles
+        // after it (right = 2), with its time, price and RSI.
+        let items = valleys(&[(100, 25)]);
+        let mut pivots = Pivots::new(2, 2);
+        assert_eq!(pivots.warm_up(), 5);
+        let confirmed: Vec<(usize, Pivot)> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| pivots.push(it).low.map(|p| (i, p)))
+            .collect();
+        assert_eq!(confirmed.len(), 1);
+        let (i, p) = confirmed[0];
+        assert_eq!(i, 4, "valley at index 2, confirmed at index 4");
+        assert_eq!((p.price, p.rsi), (d(100), d(25)));
+        assert_eq!(p.time, items[2].data.open_time);
+        // Highs: the mirrored valley gives one high pivot.
+        let mut pivots = Pivots::new(2, 2);
+        let highs = mirror(&items)
+            .iter()
+            .filter_map(|it| pivots.push(it).high)
+            .count();
+        assert_eq!(highs, 1);
     }
 }

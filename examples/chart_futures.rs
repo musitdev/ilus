@@ -30,7 +30,7 @@ use futures::{
     parse_args,
 };
 use ilus::action::{Action, ActionContext};
-use ilus::condition::divergence::{DivergenceKind, RsiDivergence};
+use ilus::condition::divergence::DivergenceKind;
 use ilus::error::ActionError;
 use ilus::executor::Executor;
 use ilus::graph::Graph;
@@ -51,7 +51,7 @@ impl TradeRecorder for ChartRecorder {
         let kind = match trade.kind {
             TradeKind::Open(Side::Long) => MarkerKind::Buy,
             TradeKind::Open(Side::Short) => MarkerKind::Sell,
-            TradeKind::Close => MarkerKind::Close,
+            TradeKind::Close | TradeKind::RsiExit => MarkerKind::Close,
             TradeKind::Stop => MarkerKind::Stop,
             TradeKind::Liquidation => MarkerKind::Liquidation,
         };
@@ -80,7 +80,7 @@ impl Action for MarkDivergence {
         event: TriggerEvent<'_, TickSignal, RsiCandle>,
         ctx: &mut ActionContext,
     ) -> Result<(), ActionError> {
-        let TickSignal::Divergence(d) = event.value else {
+        let Some(d) = &event.value.divergence else {
             return Ok(());
         };
         let (kind, label) = match d.kind {
@@ -146,11 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sol_rsi = g.transform(Rsi::new(14)?, &sol);
     let sol_chart = g.transform(chart_transformer, &sol_rsi);
     let markers = g.modifier_handle(&sol_chart);
-    let signals = g.condition(
-        "sol-divergence",
-        WithTicks(RsiDivergence::new(args.params)?),
-        &sol_rsi,
-    );
+    let signals = g.condition("sol-divergence", WithTicks::new(args.params)?, &sol_rsi);
     g.action(
         Futures::new(
             Decimal::from(10),
@@ -158,7 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.stop,
             fee,
             ChartRecorder(markers),
-        ),
+        )
+        .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1),
         &signals,
     );
     // A second action on the same condition draws the divergences.
