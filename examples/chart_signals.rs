@@ -15,6 +15,7 @@
 //! - EMA rules: big green ▲ buy / red ▼ sell at the close, labelled with the rule;
 //! - divergences: a segment between the two pivots on the price **and** on
 //!   the RSI (they go in opposite directions), blue = bullish, pink = bearish;
+//!   the two pivots A and B are marked on the RSI curve with their value;
 //! - candlestick patterns: small blue ▲ under the low / pink ▼ above the high.
 //!
 //! Run with (feature `chart`):
@@ -42,7 +43,7 @@ use ilus::source::binance::BinanceSource;
 use ilus::source::{SourceData, Timeframe};
 use ilus::transformer::Derived;
 use ilus::transformer::chart::{
-    ChartFrame, ChartModifier, ChartPanel, Marker, MarkerKind, Segment, chart_with,
+    ChartFrame, ChartModifier, ChartPanel, Marker, MarkerKind, PanelPoint, Segment, chart_with,
 };
 use ilus::transformer::combine::Combine;
 use ilus::transformer::ema::Ema;
@@ -152,6 +153,19 @@ impl Action for MarkDivergence {
             DivergenceKind::Bullish => (MarkerKind::Bullish, "bull div"),
             DivergenceKind::Bearish => (MarkerKind::Bearish, "bear div"),
         };
+        // A and B on the RSI curve, with their RSI value.
+        for (name, pivot) in [("A", &d.first), ("B", &d.second)] {
+            ctx.send(
+                &self.0,
+                ChartModifier::Point(PanelPoint {
+                    panel: ChartPanel::Indicator,
+                    time: pivot.time,
+                    value: pivot.rsi,
+                    kind,
+                    label: format!("{name} {}", pivot.rsi.round_dp(2)),
+                }),
+            );
+        }
         for (panel, from, to) in [
             (ChartPanel::Price, d.first.price, d.second.price),
             (ChartPanel::Indicator, d.first.rsi, d.second.rsi),

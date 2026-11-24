@@ -12,6 +12,7 @@
 //!   purple ✱ liquidation.
 //! - Divergences: a segment between the two pivots on the price **and** on
 //!   the RSI (they go in opposite directions); blue = bullish, pink = bearish.
+//!   The two pivots A and B are marked on the RSI curve with their value.
 //!   The trade opened by a divergence is at the end of its segments.
 //! - The RSI is shown in the bottom panel (30 / 70 lines).
 //!
@@ -35,7 +36,9 @@ use ilus::executor::Executor;
 use ilus::graph::Graph;
 use ilus::modifier::ModifierHandle;
 use ilus::source::binance::BinanceSource;
-use ilus::transformer::chart::{ChartModifier, ChartPanel, Marker, MarkerKind, Segment, chart};
+use ilus::transformer::chart::{
+    ChartModifier, ChartPanel, Marker, MarkerKind, PanelPoint, Segment, chart,
+};
 use ilus::transformer::rsi::{Rsi, RsiCandle};
 use ilus::trigger::TriggerEvent;
 use rust_decimal::Decimal;
@@ -84,6 +87,19 @@ impl Action for MarkDivergence {
             DivergenceKind::Bullish => (MarkerKind::Bullish, "bull div"),
             DivergenceKind::Bearish => (MarkerKind::Bearish, "bear div"),
         };
+        // A and B on the RSI curve, with their RSI value.
+        for (name, pivot) in [("A", &d.first), ("B", &d.second)] {
+            ctx.send(
+                &self.0,
+                ChartModifier::Point(PanelPoint {
+                    panel: ChartPanel::Indicator,
+                    time: pivot.time,
+                    value: pivot.rsi,
+                    kind,
+                    label: format!("{name} {}", pivot.rsi.round_dp(2)),
+                }),
+            );
+        }
         for (panel, from, to) in [
             (ChartPanel::Price, d.first.price, d.second.price),
             (ChartPanel::Indicator, d.first.rsi, d.second.rsi),

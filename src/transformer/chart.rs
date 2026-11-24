@@ -225,13 +225,30 @@ pub struct Segment {
     pub label: String,
 }
 
+/// A labelled point of a panel (e.g. a pivot on the RSI curve).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelPoint {
+    /// Panel to draw it in.
+    pub panel: ChartPanel,
+    /// Time (x position).
+    pub time: DateTime<Utc>,
+    /// Value (y position).
+    pub value: Decimal,
+    /// Colour, as the marker of this kind.
+    pub kind: MarkerKind,
+    /// Short text shown next to the point.
+    pub label: String,
+}
+
 /// Modifiers accepted by the [`Chart`] transformer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChartModifier {
-    /// Draw a marker (trade, signal).
+    /// Draw a marker on the price panel (trade, signal).
     Marker(Marker),
     /// Draw a segment.
     Segment(Segment),
+    /// Draw a labelled point on a panel.
+    Point(PanelPoint),
 }
 
 impl ModifierValue for ChartModifier {}
@@ -254,6 +271,15 @@ enum Msg {
         label: String,
     },
     Segment(SegmentPoint),
+    Point(LabelledPoint),
+}
+
+#[derive(Debug, Clone)]
+struct LabelledPoint {
+    panel: ChartPanel,
+    at: [f64; 2],
+    kind: MarkerKind,
+    label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +392,15 @@ impl<I: SourceData> Transformer for Chart<I> {
                 });
                 Ok(())
             }
+            ChartModifier::Point(p) => {
+                let _ = self.tx.send(Msg::Point(LabelledPoint {
+                    panel: p.panel,
+                    at: [x(p.time), f(p.value)],
+                    kind: p.kind,
+                    label: p.label,
+                }));
+                Ok(())
+            }
             ChartModifier::Segment(sg) => {
                 let _ = self.tx.send(Msg::Segment(SegmentPoint {
                     panel: sg.panel,
@@ -410,6 +445,7 @@ impl ChartWindow {
                     candles: Vec::new(),
                     markers: Vec::new(),
                     segments: Vec::new(),
+                    points: Vec::new(),
                     step: None,
                     fit_price: true,
                     pending: None,
@@ -456,6 +492,7 @@ struct App {
     candles: Vec<CandlePoint>,
     markers: Vec<MarkerPoint>,
     segments: Vec<SegmentPoint>,
+    points: Vec<LabelledPoint>,
     /// Smallest time step between candles (seconds), for the candle width.
     step: Option<f64>,
     /// Fit the price axis to the visible candles.
@@ -488,6 +525,30 @@ fn draw_segments(plot: &mut egui_plot::PlotUi<'_>, segments: &[SegmentPoint], pa
             )
             .color(color)
             .anchor(egui::Align2::LEFT_BOTTOM),
+        );
+    }
+}
+
+/// Draw the labelled points of `panel` (filled circles, label above).
+fn draw_points(plot: &mut egui_plot::PlotUi<'_>, points: &[LabelledPoint], panel: ChartPanel) {
+    for p in points.iter().filter(|p| p.panel == panel) {
+        let color = p.kind.style().color;
+        plot.points(
+            Points::new("", PlotPoints::new(vec![p.at]))
+                .shape(MarkerShape::Circle)
+                .color(color)
+                .filled(true)
+                .radius(5.0)
+                .allow_hover(false),
+        );
+        plot.text(
+            Text::new(
+                "",
+                PlotPoint::new(p.at[0], p.at[1]),
+                format!("{}\n", p.label),
+            )
+            .color(color)
+            .anchor(egui::Align2::CENTER_BOTTOM),
         );
     }
 }
@@ -595,6 +656,7 @@ impl App {
                     label,
                 }),
                 Msg::Segment(sg) => self.segments.push(sg),
+                Msg::Point(p) => self.points.push(p),
             }
         }
     }
@@ -684,6 +746,7 @@ impl App {
                     );
                 }
                 draw_segments(plot, &self.segments, ChartPanel::Price);
+                draw_points(plot, &self.points, ChartPanel::Price);
                 for kind in MarkerKind::DRAW_ORDER {
                     let style = kind.style();
                     let points: Vec<[f64; 2]> = self
@@ -744,6 +807,7 @@ impl App {
                         .color(Color32::from_rgb(120, 140, 255)),
                 );
                 draw_segments(plot, &self.segments, ChartPanel::Indicator);
+                draw_points(plot, &self.points, ChartPanel::Indicator);
             });
     }
 }
@@ -1004,5 +1068,27 @@ mod tests {
         let candles = [with_curve];
         let (lo, hi) = visible_price_range(&candles, &[], 0.0, 1.0).unwrap();
         assert!(lo < 90.0 && hi > 160.0);
+    }
+
+    #[test]
+    fn points_are_sent_with_their_panel() {
+        let (mut chart, window) = chart::<Candle>("t", "");
+        chart
+            .on_modifier(ChartModifier::Point(PanelPoint {
+                panel: ChartPanel::Indicator,
+                time: DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(2),
+                value: dec!(36.93),
+                kind: MarkerKind::Bullish,
+                label: "A 36.93".into(),
+            }))
+            .unwrap();
+        match window.rx.try_recv().unwrap() {
+            Msg::Point(p) => {
+                assert_eq!(p.panel, ChartPanel::Indicator);
+                assert_eq!(p.at, [120.0, 36.93]);
+                assert_eq!(p.label, "A 36.93");
+            }
+            _ => panic!("expected a point"),
+        }
     }
 }
