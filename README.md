@@ -416,7 +416,12 @@ cargo clippy --all-targets -- -D warnings   # also with --features chart
 ```
 
 Automated tests never use the network: they use `MockSource`, hand-made
-data and a simulated clock.
+data, recorded candles (`tests/data/`) and a simulated clock.
+
+**CI** (`.github/workflows/ci.yml`, GitHub Actions) runs these checks on
+every pull request and on `main`: `fmt`, then build, clippy and tests with
+and without the `chart` feature. They must pass before a pull request can be
+merged.
 
 ---
 
