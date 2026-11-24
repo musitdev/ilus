@@ -729,7 +729,10 @@ Crate `select`. `evolve(len, config, fitness)` runs a genetic algorithm on genom
 
 Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 – 0.25, crossover 0.7, tournament 3, patience 10, min improvement 0.5, seed 1.
 
-**Example `evolve`**: SOL/USDT 15m, the last `--days` (30) days plus the longest warm-up any genome can need, fetched once from Binance (or `--candles file.csv`, saved with `--save`); prints the best and mean fitness of each generation and the final population (scores, parameters, `--genome` line for `backtest_agent`); writes the history to a CSV file (`--history`, one line per genome and generation, with the genes and the decoded parameters).
+**Example `evolve`**: SOL/USDT 15m.
+- Periods: `--train FROM:TO` (repeatable): the fitness is the **mean** (`--combine mean`, default) or the **worst** (`--combine min`) of the gains on the training periods (e.g. a bull and a bear month); `--test FROM:TO` (repeatable): only measured on the final population, never used for selection. Without `--train`: the last `--days` (30) days.
+- Candles: every period plus the longest warm-up any genome can need, fetched once from Binance (or `--candles file.csv`, saved with `--save`).
+- Prints the best and mean fitness of each generation and the final population (fitness, gain / events / stops on each training and test period, parameters, `--genome` line for `backtest_agent`); writes the history to a CSV file (`--history`: one line per genome and generation, with the gain, events and stops of each training period, the genes and the decoded parameters).
 
 **Acceptance criteria**
 - [ ] With elitism, the best fitness never decreases; on a simple test fitness it improves towards the optimum.

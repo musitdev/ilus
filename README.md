@@ -314,8 +314,12 @@ simulated futures account. Hand-written parameters, or any genome with
 cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g25] [--events]
 ```
 
-**`evolve`** (crate `select`): evolves agent genomes on the last month of
-SOL/USDT 15m (candles fetched once; `--candles` / `--save` to reuse a CSV);
+**`evolve`** (crate `select`): evolves agent genomes on SOL/USDT 15m, on
+training periods (`--train FROM:TO`, repeatable, e.g. a bull and a bear
+month; fitness: mean or worst gain with `--combine mean|min`; default: the
+last month), and measures the final population on test periods never used
+for selection (`--test FROM:TO`); candles fetched once (`--candles` /
+`--save` to reuse a CSV);
 prints the best and mean gain per generation and the final population with
 `--genome` lines for `backtest_agent`; every evaluation goes to a history CSV
 (`--history`, default `evolve_history.csv`). All the algorithm settings are
@@ -324,7 +328,9 @@ crossover, tournament, patience, min improvement, seed), as are the account
 settings (leverage, stop, fee):
 
 ```sh
-cargo run --release -p select --example evolve -- --days 30 --generations 50 --save month.csv
+cargo run --release -p select --example evolve -- \
+  --train 2026-09-01:2026-10-01 --train 2026-10-01:2026-11-01 \
+  --test 2026-06-01:2026-07-01 --test 2026-07-01:2026-08-01 --combine mean --save data.csv
 ```
 
 ### Chart window
