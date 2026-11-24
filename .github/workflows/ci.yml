@@ -1,0 +1,56 @@
+# CI: the checks of AGENTS.md, on every pull request and on main.
+# Required before merging (branch protection on main).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: build, clippy, test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, chart]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Feature flags
+        run: |
+          if [ "${{ matrix.features }}" = chart ]; then
+            echo "FEATURES=--features chart" >> "$GITHUB_ENV"
+          else
+            echo "FEATURES=" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        run: cargo build --all-targets $FEATURES
+      - name: Clippy
+        run: cargo clippy --all-targets $FEATURES -- -D warnings
+      - name: Test
+        run: cargo test $FEATURES
