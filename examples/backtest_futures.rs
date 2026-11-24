@@ -9,8 +9,12 @@
 //! - before the period, the source bootstraps the candles needed to warm up
 //!   the RSI and the divergence detection (no trade during the warm-up);
 //! - capital: 10 SOL, converted to USDT at the first candle close; start flat;
-//! - bullish divergence (price minimum): close the short (if any), open a LONG;
-//! - bearish divergence (price maximum): close the long (if any), open a SHORT;
+//! - when flat: bullish divergence (price minimum) -> open a LONG; bearish
+//!   divergence (price maximum) -> open a SHORT;
+//! - an open position only closes on its exit rules (RSI exit, stop-loss,
+//!   liquidation); divergences are ignored while it is open
+//!   (`--flip-on-divergence`: an opposite divergence closes it and opens the
+//!   opposite one, the previous behaviour);
 //! - every position uses the whole equity as margin, with `leverage` (default 10x);
 //! - prices: close of the candle that confirms the divergence;
 //! - fee (in %) on the position notional, at each open and each close;
@@ -66,7 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &fee in &args.fees {
         g.action(
             Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ())
-                .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1),
+                .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1)
+                .with_flip_on_divergence(args.flip_on_divergence),
             &signals,
         );
     }

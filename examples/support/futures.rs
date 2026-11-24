@@ -157,6 +157,9 @@ pub struct Futures<R: TradeRecorder = ()> {
     /// above `high`, a short at the first low pivot with RSI below `low`.
     exit_rsi: Option<(Decimal, Decimal)>,
     rsi_exits: u32,
+    /// Close a position and open the opposite one on an opposite divergence
+    /// (off by default: a position closes only on its exit rules).
+    flip_on_divergence: bool,
     fee: Decimal,
     /// Equity in USDT when flat (set at the first candle).
     equity: Option<Decimal>,
@@ -195,6 +198,7 @@ impl<R: TradeRecorder> Futures<R> {
             stops: 0,
             exit_rsi: None,
             rsi_exits: 0,
+            flip_on_divergence: false,
             fee: fee_pct / Decimal::ONE_HUNDRED,
             equity: None,
             start_equity: Decimal::ZERO,
@@ -223,6 +227,16 @@ impl<R: TradeRecorder> Futures<R> {
             self.log,
             "RSI exit: long at a high with RSI > {high}, short at a low with RSI < {low}"
         );
+        self
+    }
+
+    /// On an opposite divergence, close the position and open the opposite
+    /// one (the previous behaviour). Off by default.
+    pub fn with_flip_on_divergence(mut self, flip: bool) -> Self {
+        self.flip_on_divergence = flip;
+        if flip {
+            let _ = writeln!(self.log, "Flip on opposite divergence");
+        }
         self
     }
 
@@ -430,6 +444,16 @@ impl<R: TradeRecorder> Futures<R> {
             return;
         }
         if self.position.is_some_and(|p| p.side == opposite) {
+            if !self.flip_on_divergence {
+                // An open position only closes on its exit rules (RSI exit,
+                // stop-loss, liquidation), not on an opposite divergence.
+                let _ = writeln!(
+                    self.log,
+                    "{when}  skip {:?} divergence (position open)",
+                    d.kind
+                );
+                return;
+            }
             self.close(&when, c.close, TradeKind::Close);
         }
         if d.kind == DivergenceKind::Bearish {
@@ -520,6 +544,9 @@ pub struct Args {
     pub tick: Duration,
     /// RSI exit levels (`--exit-rsi-high`, `--exit-rsi-low`; default 75 / 30).
     pub exit_rsi: (Decimal, Decimal),
+    /// `--flip-on-divergence`: an opposite divergence closes the position and
+    /// opens the opposite one (default: ignored while a position is open).
+    pub flip_on_divergence: bool,
     /// Description of the run.
     pub header: String,
 }
@@ -535,6 +562,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut leverage = Decimal::from(10);
     let mut tick = Duration::ZERO;
     let mut exit_rsi = (Decimal::from(75), Decimal::from(30));
+    let mut flip_on_divergence = false;
     let mut stop: Option<Decimal> = None;
     // Pivot options; the gaps are given in candles and converted below.
     let (mut left, mut right) = (None::<usize>, None::<usize>);
@@ -542,6 +570,11 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let (mut rsi_low, mut rsi_high, mut lookahead) =
         (None::<Decimal>, None::<Decimal>, None::<usize>);
     while let Some(flag) = args.first().filter(|a| a.starts_with("--")).cloned() {
+        if flag == "--flip-on-divergence" {
+            flip_on_divergence = true;
+            args.remove(0);
+            continue;
+        }
         let value = args.get(1).ok_or(format!("{flag} needs a value"))?.clone();
         match flag.as_str() {
             "--days" => days = value.parse().map_err(|e| format!("invalid --days: {e}"))?,
@@ -654,7 +687,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         return Err("the start must be before the end".into());
     }
     let header = format!(
-        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, RSI exit {} / {}, from {} to {} (UTC)\n",
+        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, RSI exit {} / {}, {}, from {} to {} (UTC)\n",
         leverage.normalize(),
         stop.map_or("none".to_string(), |p| format!("{}%", p.normalize())),
         params.left,
@@ -665,6 +698,11 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         params.lookahead,
         exit_rsi.0,
         exit_rsi.1,
+        if flip_on_divergence {
+            "flip on divergence"
+        } else {
+            "no flip"
+        },
         fmt_time(from),
         fmt_time(now)
     );
@@ -679,6 +717,7 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         fees,
         tick,
         exit_rsi,
+        flip_on_divergence,
         header,
     })
 }

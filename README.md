@@ -249,12 +249,14 @@ cargo run --example backtest_divergence -- --days 7 15m 0 0.2
 ```
 
 **`backtest_futures`** (futures with leverage). It starts with 10 SOL of
-capital, converted to USDT at the first candle. A bullish divergence opens a
-long and a bearish divergence opens a short; any opposite position is closed
-first. A position also closes on an **RSI exit**: a long at the next price
-high (pivot) with RSI above 75, a short at the next low with RSI below 30. It
-also simulates fees (on the position size), an optional stop-loss and
-liquidation. Funding is ignored.
+capital, converted to USDT at the first candle. When flat, a bullish
+divergence opens a long and a bearish divergence opens a short. An open
+position closes only on its exit rules: the **RSI exit** (a long at the next
+price high (pivot) with RSI above 75, a short at the next low with RSI below
+30), the stop-loss or a liquidation; divergences are ignored while it is open
+(`--flip-on-divergence` restores the previous behaviour: an opposite
+divergence closes it and opens the opposite one). It also simulates fees (on
+the position size). Funding is ignored.
 
 ```sh
 cargo run --example backtest_futures -- [options] [timeframe] [fees %...]
@@ -273,6 +275,7 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `--min-gap N` | minimum distance between the two pivots of a divergence, in candles | 5 at 1m, 3 at 5m, 2 from 15m |
 | `--rsi-low R` / `--rsi-high R` | RSI level of the first low / high of a divergence (100 / 0: any level) | 30 / 70 |
 | `--lookahead N` | pivots after the first one in which the diverging one is searched | 3 |
+| `--flip-on-divergence` | an opposite divergence closes the position and opens the opposite one | off |
 | `--exit-rsi-high R` / `--exit-rsi-low R` | RSI exit: a long closes at the next high pivot with RSI above R, a short at the next low pivot with RSI below R (100 / 0: disabled) | 75 / 30 |
 | `--tick-ms N` | replay tick, in ms (0: as fast as possible) | 0 |
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |

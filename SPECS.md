@@ -611,7 +611,7 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 
 **Price pivots** (`Pivots`, used by the divergence condition and by the futures simulation): a candle whose low (high) is strictly beyond the `left` candles before it and at least as far as the `right` candles after it, confirmed `right` candles later, with its RSI.
 
-**RSI exit** (futures simulation example): a long closes at the first **high** pivot after entry whose RSI is **above** `exit_rsi_high` (default 75); a short at the first **low** pivot whose RSI is **below** `exit_rsi_low` (default 30); at the close of the candle confirming the pivot. The stop-loss and the opposite divergence stay; the first one closes the position. After an RSI exit, the account is flat until the next divergence.
+**RSI exit** (futures simulation example): a long closes at the first **high** pivot after entry whose RSI is **above** `exit_rsi_high` (default 75); a short at the first **low** pivot whose RSI is **below** `exit_rsi_low` (default 30); at the close of the candle confirming the pivot. The stop-loss (and liquidation) stay; the first one closes the position. **Divergences are ignored while a position is open**: an opposite divergence does not close it (the exit thresholds, e.g. 75 / 30, differ from the divergence start thresholds, so an opposite divergence may come before the exit). After an exit, the account is flat until the next divergence. Option `--flip-on-divergence`: the previous behaviour (an opposite divergence closes the position and opens the opposite one).
 
 **Acceptance criteria:**
 - [ ] EMA and MACD values match hand-computed sequences.

@@ -155,7 +155,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fee,
             ChartRecorder(markers),
         )
-        .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1),
+        .with_rsi_exit(args.exit_rsi.0, args.exit_rsi.1)
+        .with_flip_on_divergence(args.flip_on_divergence),
         &signals,
     );
     // A second action on the same condition draws the divergences.
