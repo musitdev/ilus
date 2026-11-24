@@ -1,193 +1,222 @@
-//! Test agent (spec F9): five rules vote, a decision condition trades.
+//! Test agent (spec F9, F10) on SOL/USDT 15m history from Binance.
 //!
-//! ```text
-//! SOLUSDT 15m ─┬─> Decision(open 3, exit 2) ──> Account (futures sim) ──┐ Closed
-//!              │      ^ Vote modifiers                                   │
-//!              ├─> Rsi(14) ─> DivergenceVoter 15m ─> SendVotes ──────────┤
-//!              ├─> Aggregate 1h ─> OnValue(Rsi 14) ─> Projected(DivergenceVoter 1h) ─> SendVotes
-//!              ├─> Combine(Ema 9, Ema 21) ─> EmaCrossVoter ─> SendVotes
-//!              ├─> Trend(EMA 50) ─> TrendVoter ─> SendVotes
-//!              └─> PatternVoter (13 patterns) ─> SendVotes
-//! ```
+//! 1. Fetch the candles once (a small graph: Binance replay -> collect).
+//! 2. Simulate the agent with [`agent::simulate`]: five rules (15m and 1h
+//!    divergences, EMA cross, trend, candlestick patterns) vote, the
+//!    decision trades a simulated futures account.
 //!
-//! Fixed genes (weights open / exit): divergence 15m 2 / 1, divergence 1h
-//! 3 / 1, EMA 9/21 cross 1 / 1, trend EMA 50 1 / 1, patterns 1 / 0.5;
-//! thresholds open 3, exit 2. Divergences: the `--rsi-low` / `--rsi-high`,
-//! `--lookahead`, `--left` / `--right` options (both timeframes); RSI exits
-//! `--exit-rsi-high` / `--exit-rsi-low`. Account: 10 SOL, `--leverage`,
-//! `--stop` (safety net), one simulation per fee. Always 15m.
+//! Without `--genome`, hand-written parameters are used: weights open / exit
+//! div15 2 / 1, div1h 3 / 1, EMA 9/21 1 / 1, trend EMA 50 1 / 1, patterns
+//! 1 / 0.5; thresholds open 3, exit 2; divergences RSI 30 / 70, lookahead 3,
+//! RSI exit 75 / 30.
 //!
-//! e.g. `cargo run --release --example backtest_agent -- --days 60 --leverage 2 --stop 3 15m 0.05`
+//! `cargo run --release --example backtest_agent -- [--days N] [--leverage L]
+//! [--stop P] [--fee F] [--genome g1,g2,...] [--events]`
+//! (defaults: 60 days, 2x, stop 3 %, fee 0.05 %).
 
-#[path = "../../trading/examples/support/futures.rs"]
-mod futures;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use agent::decision::{Decision, DecisionEvent, DecisionKind, DecisionParams};
-use agent::voters::{DivergenceVoter, EmaCrossVoter, PatternVoter, TrendVoter};
-use agent::{DecisionModifier, SendVotes, Side, Weights};
-use futures::{Futures, Side as AccountSide, fmt_time, parse_args};
+use agent::Weights;
+use agent::account::{AccountParams, EventKind};
+use agent::decision::DecisionParams;
+use agent::genome::{AgentParams, DivergenceGenes, GENOME_LEN};
+use agent::simulate::{SimConfig, history_needed, simulate_params};
+use chrono::{DateTime, Days, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use trading::action::{Action, ActionContext};
 use trading::candle::Candle;
-use trading::condition::divergence::DivergenceParams;
-use trading::condition::patterns::{PatternCondition, ThresholdSet};
-use trading::condition::projected::{Projected, aggregated};
-use trading::error::ActionError;
+use trading::condition::Condition;
+use trading::error::{ActionError, ModifierError};
 use trading::executor::Executor;
 use trading::graph::Graph;
-use trading::modifier::ModifierHandle;
-use trading::source::Timeframe;
+use trading::modifier::NoModifier;
 use trading::source::binance::BinanceSource;
-use trading::transformer::aggregate::Aggregate;
-use trading::transformer::combine::{Combine, OnValue};
-use trading::transformer::ema::Ema;
-use trading::transformer::rsi::Rsi;
-use trading::transformer::trend::Trend;
-use trading::trigger::TriggerEvent;
+use trading::source::{Item, Timeframe};
+use trading::trigger::{Detection, TriggerEvent, TriggerEventType, TriggerValue};
 
-/// Bootstrap candles: covers the 1h chain (RSI 14 + pivots, in 1h candles).
-const BOOTSTRAP: usize = 4 * (15 + 10) + 4;
+/// Every candle (to collect them).
+struct Every;
 
-/// The account: trades the decisions, tells the decision when the
-/// stop-loss or a liquidation closed the position.
-struct Account {
-    futures: Futures<(), Candle>,
-    decision: ModifierHandle<DecisionModifier>,
+#[derive(Debug)]
+struct Tick;
+impl TriggerValue for Tick {}
+
+impl Condition for Every {
+    type Input = Candle;
+    type Value = Tick;
+    type Modifier = NoModifier;
+    fn warm_up(&self) -> usize {
+        0
+    }
+    fn on_data(&mut self, _: Item<'_, Candle>) -> Option<Detection<Tick>> {
+        Some(Detection {
+            event_type: TriggerEventType::Other("candle"),
+            value: Tick,
+        })
+    }
+    fn on_modifier(&mut self, m: NoModifier) -> Result<Option<Detection<Tick>>, ModifierError> {
+        match m {}
+    }
 }
 
-impl Action for Account {
-    type Value = DecisionEvent;
-    type Input = Candle;
+struct Collect(Arc<Mutex<Vec<Candle>>>);
 
+impl Action for Collect {
+    type Value = Tick;
+    type Input = Candle;
     fn run(
         &mut self,
-        event: TriggerEvent<'_, DecisionEvent, Candle>,
-        ctx: &mut ActionContext,
+        event: TriggerEvent<'_, Tick, Candle>,
+        _: &mut ActionContext,
     ) -> Result<(), ActionError> {
-        let c = event.data;
-        let e = event.value;
-        match e.kind {
-            DecisionKind::Tick => {
-                if self.futures.agent_candle(c) {
-                    ctx.send(&self.decision, DecisionModifier::Closed);
-                }
-            }
-            DecisionKind::Open(side) => {
-                self.futures.agent_log(&format!(
-                    "{}  decision: open {side:?} (long {}, short {})",
-                    fmt_time(c.open_time),
-                    e.long,
-                    e.short
-                ));
-                let side = match side {
-                    Side::Long => AccountSide::Long,
-                    Side::Short => AccountSide::Short,
-                };
-                self.futures.agent_open(side, c);
-            }
-            DecisionKind::Exit(side) => {
-                self.futures.agent_log(&format!(
-                    "{}  decision: exit {side:?} (exit score {})",
-                    fmt_time(c.open_time),
-                    e.exit
-                ));
-                self.futures.agent_exit(c);
-            }
+        if let Ok(mut v) = self.0.lock() {
+            v.push(event.data.clone());
         }
         Ok(())
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args()?;
-    let m15 = Timeframe::M15;
-    let p15 = DivergenceParams {
-        min_gap: DivergenceParams::for_timeframe(m15).min_gap,
-        ..args.params
-    };
-    let p1h = DivergenceParams {
-        min_gap: DivergenceParams::for_timeframe(Timeframe::H1).min_gap,
-        ..args.params
-    };
-    let (exit_high, exit_low) = args.exit_rsi;
-    let w = |open, exit| Weights { open, exit };
-    println!(
-        "Test agent SOL/USDT 15m, {}x, stop-loss {}, divergences RSI {} / {}, lookahead {}, RSI exit {} / {}, from {} to {} (UTC)\n",
-        args.leverage.normalize(),
-        args.stop
-            .map_or("none".to_string(), |p| format!("{}%", p.normalize())),
-        args.params.rsi_low,
-        args.params.rsi_high,
-        args.params.lookahead,
-        exit_high,
-        exit_low,
-        fmt_time(args.from),
-        fmt_time(args.to)
-    );
-
+/// SOL/USDT 15m candles from `from` to `to` (excluded), from Binance.
+fn fetch(
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
+    let out = Arc::new(Mutex::new(Vec::new()));
     let mut g = Graph::new();
-    let sol = g.source(
-        BinanceSource::new("SOLUSDT", m15)
-            .replay(args.from, args.to)
-            .with_bootstrap(BOOTSTRAP),
-    );
+    let src = g.source(BinanceSource::new("SOLUSDT", Timeframe::M15).replay(from, to));
+    let c = g.condition("every", Every, &src);
+    g.action(Collect(out.clone()), &c);
+    Executor::new(g).with_tick(Duration::ZERO).run()?;
+    let v = out.lock().map_err(|_| "lock poisoned")?.clone();
+    Ok(v)
+}
 
-    // Decision and accounts (first: they see each candle before the votes).
-    let decision = g.condition(
-        "decision",
-        Decision::<Candle>::new(DecisionParams {
+/// The hand-written test agent.
+fn hand_params() -> AgentParams {
+    let w = |open, exit| Weights { open, exit };
+    let div = DivergenceGenes {
+        rsi_low: dec!(30),
+        rsi_high: dec!(70),
+        lookahead: 3,
+        exit_rsi_high: dec!(75),
+        exit_rsi_low: dec!(30),
+    };
+    AgentParams {
+        div15: w(dec!(2), dec!(1)),
+        div1h: w(dec!(3), dec!(1)),
+        ema: w(dec!(1), dec!(1)),
+        trend: w(dec!(1), dec!(1)),
+        patterns: w(dec!(1), dec!(0.5)),
+        decision: DecisionParams {
             open_threshold: dec!(3),
             exit_threshold: dec!(2),
-        })?,
-        &sol,
-    );
-    let to = g.modifier_handle(&decision);
-    for &fee in &args.fees {
-        let futures = Futures::new(Decimal::from(10), args.leverage, args.stop, fee, ());
-        g.action(
-            Account {
-                futures,
-                decision: to,
-            },
-            &decision,
-        );
+        },
+        div15_rule: div,
+        div1h_rule: div,
+        ema_fast: 9,
+        ema_slow: 21,
+        trend_period: 50,
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut days: u64 = 60;
+    let mut leverage = dec!(2);
+    let mut stop = Some(dec!(3));
+    let mut fee = dec!(0.05);
+    let mut params = hand_params();
+    let mut events = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        if flag == "--events" {
+            events = true;
+            continue;
+        }
+        let value = args.next().ok_or(format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--days" => days = value.parse()?,
+            "--leverage" => leverage = value.parse()?,
+            "--stop" => stop = Some(value.parse()?).filter(|s: &Decimal| !s.is_zero()),
+            "--fee" => fee = value.parse()?,
+            "--genome" => {
+                let genes: Vec<f64> = value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?;
+                if genes.len() != GENOME_LEN {
+                    return Err(format!("--genome: {GENOME_LEN} genes expected").into());
+                }
+                params = AgentParams::decode(&genes)?;
+            }
+            _ => return Err(format!("unknown option {flag}").into()),
+        }
     }
 
-    // Rule 1: 15m divergence.
-    let rsi = g.transform(Rsi::new(14)?, &sol);
-    let v = g.condition(
-        "div-15m",
-        DivergenceVoter::new(p15, exit_high, exit_low)?,
-        &rsi,
+    let today = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .ok_or("date")?
+        .and_utc();
+    let from = today
+        .checked_sub_days(Days::new(days))
+        .ok_or("--days too large")?;
+    // History before `from` for the warm-up (15 min per candle).
+    let warm = history_needed(&params) as i64;
+    let fetch_from = from - chrono::TimeDelta::minutes(15 * warm);
+    let to = Utc::now();
+    let candles = fetch(fetch_from, to)?;
+
+    let cfg = SimConfig {
+        from,
+        to,
+        account: AccountParams {
+            capital: dec!(1000),
+            leverage,
+            stop_pct: stop,
+            fee_pct: fee,
+        },
+    };
+    let r = simulate_params(&params, &candles, &cfg)?;
+    println!("Agent: {}", r.params);
+    println!(
+        "SOL/USDT 15m {} -> {} (UTC), {}x, stop {}, fee {}% ({} candles)",
+        from.format("%Y-%m-%d %H:%M"),
+        to.format("%Y-%m-%d %H:%M"),
+        leverage.normalize(),
+        stop.map_or("none".into(), |s| format!("{}%", s.normalize())),
+        fee.normalize(),
+        candles.len()
     );
-    g.action(SendVotes::new("div-15m", w(dec!(2), dec!(1)), to), &v);
-
-    // Rule 2: 1h divergence, on the 1h candles aggregated from the 15m ones.
-    let h1 = g.transform(Aggregate::new(m15, Timeframe::H1)?, &sol);
-    let h1_rsi = g.transform(OnValue::new(Rsi::new(14)?), &h1);
-    let voter = Projected::new(
-        DivergenceVoter::new(p1h, exit_high, exit_low)?,
-        aggregated::<Decimal>,
+    let a = &r.account;
+    if events {
+        for e in &a.events {
+            let what = match e.kind {
+                EventKind::Open(s) => format!("OPEN  {s:?}"),
+                EventKind::Close(s, why) => format!("CLOSE {s:?} ({why:?})"),
+            };
+            println!(
+                "{}  {what:<24} @ {:<10} equity {}",
+                e.time.format("%Y-%m-%d %H:%M"),
+                e.price.normalize(),
+                e.equity.round_dp(2)
+            );
+        }
+    }
+    println!(
+        "=== {} events, {} stops, {} liquidations, fees {} USDT, lowest equity {} USDT",
+        a.trades,
+        a.stops,
+        a.liquidations,
+        a.fees_paid.round_dp(2),
+        a.min_equity.round_dp(2)
     );
-    let v = g.condition("div-1h", voter, &h1_rsi);
-    g.action(SendVotes::new("div-1h", w(dec!(3), dec!(1)), to), &v);
-
-    // Rule 3: fast / slow EMA cross.
-    let emas = g.transform(Combine::new((Ema::new(9)?, Ema::new(21)?)), &sol);
-    let v = g.condition("ema-9-21", EmaCrossVoter::default(), &emas);
-    g.action(SendVotes::new("ema-9-21", w(dec!(1), dec!(1)), to), &v);
-
-    // Rule 4: trend (close vs EMA 50).
-    let trend = g.transform(Trend::<Candle>::new(50)?, &sol);
-    let v = g.condition("trend-50", TrendVoter::default(), &trend);
-    g.action(SendVotes::new("trend-50", w(dec!(1), dec!(1)), to), &v);
-
-    // Rule 5: the 13 candlestick patterns.
-    let patterns = PatternVoter::new(PatternCondition::new(ThresholdSet::default())?);
-    let v = g.condition("patterns", patterns, &sol);
-    g.action(SendVotes::new("patterns", w(dec!(1), dec!(0.5)), to), &v);
-
-    Executor::new(g).with_tick(args.tick).run()?;
+    println!(
+        "Gain (fitness): {}%  (equity {} USDT)",
+        r.gain_pct().round_dp(2),
+        a.final_equity.round_dp(2)
+    );
     Ok(())
 }

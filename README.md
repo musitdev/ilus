@@ -144,6 +144,10 @@ Key properties:
   threshold, exits when the exit score does, at most once per candle, and
   clears every ballot after a decision. Weights, thresholds and rule
   parameters are the genes of a later selection algorithm.
+- **Agent simulation** (crate `agent`, `simulate`): the fitness of a genome
+  (25 genes in [0, 1] decoded into the agent's parameters): the agent runs on
+  15m candles given in memory and trades a simulated futures account
+  (`account::Account`); the result is the gain in %, with every trade event.
 - **Actions**
   - `Alert`: prints the trigger event. Works with any condition.
 
@@ -296,14 +300,14 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |
 
-**`backtest_agent`** (test multi-rule agent, 15m): five rules vote (15m and
-1h RSI divergences, EMA 9/21 cross, trend EMA 50, the 13 patterns) with
-fixed weights; the decision trades on the futures simulation account (the
-stop-loss stays as a safety net). Same options as `backtest_futures` for the
-period, leverage, stop, divergences, RSI exits and fees:
+**`backtest_agent`** (test multi-rule agent, 15m): fetches the candles from
+Binance once, then runs `agent::simulate`: five rules vote (15m and 1h RSI
+divergences, EMA cross, trend, the 13 patterns), the decision trades the
+simulated futures account. Hand-written parameters, or any genome with
+`--genome`:
 
 ```sh
-cargo run --release --example backtest_agent -- --days 60 --leverage 2 --stop 3 15m 0.05
+cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g25] [--events]
 ```
 
 ### Chart window
@@ -395,17 +399,21 @@ crates/trading/            the engine (lib name `trading`)
     error.rs            error types
   examples/             runnable examples (see above)
     common/             helpers for the flow_* examples and simple
-    support/futures.rs  futures simulation (backtest_futures, chart_futures, backtest_agent)
+    support/futures.rs  futures simulation of backtest_futures and chart_futures
   tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
   tests/trend_filter.rs trend filter in a graph
 crates/agent/              the multi-rule agent
   src/lib.rs            ballots, votes, SendVotes action
   src/decision.rs       decision condition (weighted votes)
   src/voters.rs         one voter condition per rule
+  src/account.rs        simulated futures account
+  src/genome.rs         genome (25 genes) <-> AgentParams
+  src/simulate.rs       simulate: the fitness of a genome
   examples/backtest_agent.rs  test agent on the futures simulation
   tests/agent.rs        votes triggering the decision in the same tick
   tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
                         against an independent computation
+  tests/simulate.rs     simulations on the same candles: accounting, determinism, errors
   tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
 crates/select/             evolutionary search of agent genomes (not implemented yet)
 ```

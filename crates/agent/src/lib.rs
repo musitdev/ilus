@@ -11,8 +11,15 @@
 //! - [`SendVotes`]: the action of a rule; sends each ballot to the decision
 //!   with the rule's weight.
 //! - [`decision::Decision`]: adds up the weights, opens and exits.
+//! - [`genome`]: the genome (genes in [0, 1]) and the agent's parameters.
+//! - [`account`]: the simulated futures account.
+//! - [`simulate`](simulate::simulate): runs the agent of a genome on candles;
+//!   the gain in % is the fitness used by the selection.
 
+pub mod account;
 pub mod decision;
+pub mod genome;
+pub mod simulate;
 pub mod voters;
 
 use std::marker::PhantomData;

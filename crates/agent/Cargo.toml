@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-description = "ilus multi-rule agent: voters and weighted decision"
+description = "ilus multi-rule agent: voters, weighted decision, genome and simulation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,4 @@ license.workspace = true
 trading.workspace = true
 chrono.workspace = true
 rust_decimal.workspace = true
-
-[dev-dependencies]
 rust_decimal_macros.workspace = true

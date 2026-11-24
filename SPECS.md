@@ -683,6 +683,37 @@ A trading agent combines several **rules**. Each rule is an ordinary chain of th
 - [ ] `Projected` runs its condition once per new aggregated candle.
 - [ ] In a graph, votes sent within a tick trigger the decision in the same tick.
 
+### F10 — Agent simulation (fitness of a genome)
+
+Crate `agent`. The evolutionary algorithm calls `simulate(genome, candles, config)` to get the **fitness** of a genome: the **gain in %** of a simulated futures account traded by the agent of that genome.
+
+**Genome**: a vector of `GENOME_LEN` (25) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
+
+| Genes | Range (step) |
+|---|---|
+| open / exit weight of each rule (div 15m, div 1h, EMA cross, trend, patterns): 10 genes | 0 – 5 (0.25) |
+| open threshold, exit threshold | 0.25 – 10 (0.25) |
+| per divergence (15m, 1h): RSI low, RSI high, lookahead, RSI exit high, RSI exit low | 20 – 50, 50 – 80, 1 – 6, 60 – 90, 10 – 40 (1) |
+| EMA fast period; slow = fast + gap; trend EMA period | 5 – 50, gap 1 – 150, 20 – 300 (1) |
+
+Fixed (not genes): RSI 14, pivots `left` / `right` 3, divergence `min_gap` 2 candles of its timeframe, the default pattern thresholds.
+
+**Simulation settings** (`SimConfig`, not genes): `from`, `to` (excluded), the account: capital (quote currency), leverage, stop-loss %, fee % (on the position size, per open and per close).
+
+**Candles**: 15m, given by the caller (loaded once; no network in the simulation), run through a `MockSource`. The candles before `from` are the bootstrap; at least `history_needed(params)` of them are required (error otherwise). The 1h candles are aggregated from the 15m ones.
+
+**Account** (`account::Account`): one position at a time with the whole equity as margin (`margin = equity / (1 + leverage × fee)`), opened / closed at the close of the decision candle; stop-loss filled at its level (or at the open on a gap); liquidation when the equity at the worst price of a candle falls to the maintenance margin (0.5 % of the notional): equity 0, no more trading. Funding is ignored. When the stop-loss or a liquidation closes the position, or a position cannot be opened, the account sends `Closed` to the decision.
+
+**Result** (`SimResult`): the decoded parameters and the account summary: gain % (the fitness; an open position is marked at the last close), final and lowest equity, number of events, stops, liquidations, fees, and **every trade event** (time, open long / short or close with its reason, price, equity): the training data of the later network.
+
+Each call builds and runs its own executor: simulations can run in parallel threads (not from inside an async task).
+
+**Acceptance criteria**
+- [ ] A genome decodes to the documented ranges; out-of-range genes are clamped, NaN and a wrong length are errors; encode then decode gives the same parameters.
+- [ ] The account computes margin, fees, P&L, stop-loss fills and liquidation as specified.
+- [ ] On real candles, the equity recomputed from the events equals the account's, the events alternate open / close, and the gain is consistent with the final equity.
+- [ ] A simulation is deterministic; zero weights never trade; too little history or invalid settings are errors.
+
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.
 - **CLI**: to be defined (at least: start the bot).
