@@ -268,7 +268,9 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `--leverage L` | leverage | 10 |
 | `--stop P` | stop-loss, in % of price against the entry | none |
 | `--left N` / `--right N` | pivot candles before / after (`right` = confirmation delay) | 3 / 3 |
-| `--min-gap N` / `--max-gap N` | distance between two compared pivots, in candles | 60 max; min 5 at 1m, 3 at 5m, 2 from 15m |
+| `--min-gap N` | minimum distance between the two pivots of a divergence, in candles | 5 at 1m, 3 at 5m, 2 from 15m |
+| `--rsi-low R` / `--rsi-high R` | RSI level of the first low / high of a divergence (100 / 0: any level) | 30 / 70 |
+| `--lookahead N` | pivots after the first one in which the diverging one is searched | 3 |
 | `--tick-ms N` | replay tick, in ms (0: as fast as possible) | 0 |
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |

@@ -461,7 +461,8 @@ pub struct Args {
 }
 
 /// Parse `[--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N]
-/// [--right N] [--min-gap N] [--max-gap N] [--tick-ms N] [timeframe] [fees %...]`.
+/// [--right N] [--min-gap N] [--rsi-low R] [--rsi-high R] [--lookahead N] [--tick-ms N]
+/// [timeframe] [fees %...]`.
 pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut days: u64 = 1;
@@ -472,7 +473,9 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut stop: Option<Decimal> = None;
     // Pivot options; the gaps are given in candles and converted below.
     let (mut left, mut right) = (None::<usize>, None::<usize>);
-    let (mut min_gap, mut max_gap) = (None::<i32>, None::<i32>);
+    let mut min_gap = None::<i32>;
+    let (mut rsi_low, mut rsi_high, mut lookahead) =
+        (None::<Decimal>, None::<Decimal>, None::<usize>);
     while let Some(flag) = args.first().filter(|a| a.starts_with("--")).cloned() {
         let value = args.get(1).ok_or(format!("{flag} needs a value"))?.clone();
         match flag.as_str() {
@@ -518,11 +521,20 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                         .map_err(|e| format!("invalid --min-gap: {e}"))?,
                 )
             }
-            "--max-gap" => {
-                max_gap = Some(
+            "--rsi-low" => {
+                rsi_low =
+                    Some(Decimal::from_str(&value).map_err(|e| format!("invalid --rsi-low: {e}"))?)
+            }
+            "--rsi-high" => {
+                rsi_high = Some(
+                    Decimal::from_str(&value).map_err(|e| format!("invalid --rsi-high: {e}"))?,
+                )
+            }
+            "--lookahead" => {
+                lookahead = Some(
                     value
                         .parse()
-                        .map_err(|e| format!("invalid --max-gap: {e}"))?,
+                        .map_err(|e| format!("invalid --lookahead: {e}"))?,
                 )
             }
             _ => return Err(format!("unknown option {flag}").into()),
@@ -547,9 +559,9 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     if let Some(n) = min_gap {
         params.min_gap = candle * n;
     }
-    if let Some(n) = max_gap {
-        params.max_gap = candle * n;
-    }
+    params.rsi_low = rsi_low.unwrap_or(params.rsi_low);
+    params.rsi_high = rsi_high.unwrap_or(params.rsi_high);
+    params.lookahead = lookahead.unwrap_or(params.lookahead);
     let mut fees = args
         .iter()
         .map(|a| Decimal::from_str(a).map_err(|e| format!("invalid fee '{a}': {e}")))
@@ -569,13 +581,15 @@ pub fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         return Err("the start must be before the end".into());
     }
     let header = format!(
-        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, gap {}..{} candles, from {} to {} (UTC)\n",
+        "Futures simulation SOL/USDT {timeframe}, {}x, stop-loss {}, pivots left {} / right {}, min gap {} candles, RSI {} / {}, lookahead {}, from {} to {} (UTC)\n",
         leverage.normalize(),
         stop.map_or("none".to_string(), |p| format!("{}%", p.normalize())),
         params.left,
         params.right,
         params.min_gap.num_seconds() / candle.num_seconds(),
-        params.max_gap.num_seconds() / candle.num_seconds(),
+        params.rsi_low,
+        params.rsi_high,
+        params.lookahead,
         fmt_time(from),
         fmt_time(now)
     );

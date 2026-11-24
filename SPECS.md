@@ -538,8 +538,11 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 | Bullish (bear phase) | minima | `price B < price A` | `RSI B > RSI A` |
 | Bearish (bull phase) | maxima | `price B > price A` | `RSI B < RSI A` |
 
-- The time between A and B (measured on the pivot times, so independent of the timeframe and of missing candles) must be within `[min_gap, max_gap]`, bounds included; otherwise no divergence (too close = noise, too far = unrelated).
-- Whatever the result, B becomes the new previous pivot.
+**Search** (lows; highs are the mirror, with `rsi_high` and "higher"):
+- A low **starts a search** (first pivot A) only if its RSI is **at most `rsi_low`** (e.g. 30). With `rsi_low` = 100 (and `rsi_high` = 0 for highs), any low starts a search (divergences at any RSI level).
+- The diverging low B is searched in the **next `lookahead` lows** after A (e.g. 3). The first one that diverges (lower price, higher RSI) and comes at least `min_gap` after A (pivot times, so independent of missing candles) gives the signal, when B is confirmed. **A is consumed**: the next signal needs a new A (B does not start one).
+- A low that does not diverge and has a **lower RSI than A** becomes the **new A** and restarts the window. Other lows (including oversold ones with a higher RSI than A) only count.
+- After `lookahead` lows without divergence, **A expires**; the last low may then start a new search.
 
 **Default parameters** (`DivergenceParams::for_timeframe`; `Default` = 1m):
 
@@ -548,9 +551,11 @@ let btc_rsi = g.transform(Rsi::new(14)?, &btc_1m);
 | `left` | 3 candles | candles before a pivot |
 | `right` | 3 candles | candles after a pivot (confirmation delay) |
 | `min_gap` | 5 candles at 1m (5 min), 3 at 5m (15 min), 2 from 15m up (30 min at 15m) | min time between A and B |
-| `max_gap` | 60 candles (1 h at 1m, 15 h at 15m) | max time between A and B |
+| `rsi_low` | 30 | max RSI of the first low (100: any level) |
+| `rsi_high` | 70 | min RSI of the first high (0: any level) |
+| `lookahead` | 3 pivots | pivots after A in which B is searched |
 
-The gaps are durations whose defaults depend on the candle duration, so a timeframe change keeps a sensible meaning.
+`min_gap` is a duration whose default depends on the candle duration, so a timeframe change keeps a sensible meaning.
 
 **Detection value:** kind (bullish/bearish), pivot A and pivot B (time, price, RSI), confirmation time. Event types: `BullishDivergence`, `BearishDivergence`.
 
@@ -558,11 +563,15 @@ The gaps are durations whose defaults depend on the candle duration, so a timefr
 - [ ] Given a lower price minimum with a higher RSI, Then a bullish divergence is emitted when pivot B is confirmed.
 - [ ] Given a higher price maximum with a lower RSI, Then a bearish divergence is emitted when pivot B is confirmed.
 - [ ] Given a lower price minimum with a lower RSI, Then nothing is emitted.
-- [ ] Given pivots closer than `min_gap` or farther than `max_gap` (in time), Then nothing is emitted.
+- [ ] Given pivots closer than `min_gap` (in time), Then nothing is emitted.
+- [ ] A first low with RSI above `rsi_low` starts no search (first high: below `rsi_high`).
+- [ ] The diverging pivot is searched in the next `lookahead` pivots only; then A expires.
+- [ ] A non-diverging pivot with a more extreme RSI than A becomes the new A; other pivots only count.
+- [ ] A is consumed by a divergence.
 - [ ] The default gaps depend on the timeframe (e.g. 30 min minimum at 15m).
 - [ ] No detection is emitted before the `right` candles after pivot B have closed.
 - [ ] A pivot without RSI (warm-up) is ignored.
-- [ ] Invalid parameters (`left` or `right` = 0, negative `min_gap`, `min_gap > max_gap`) are rejected.
+- [ ] Invalid parameters (`left`, `right` or `lookahead` = 0, negative `min_gap`, RSI levels outside 0..=100) are rejected.
 
 ### F7 — Chart transformer
 **Why:** To understand a strategy, one needs to see the candles, the indicator and the trades together.

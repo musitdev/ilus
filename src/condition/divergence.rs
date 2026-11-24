@@ -6,6 +6,16 @@
 //! Minima / maxima are pivots: a candle whose low (high) is beyond the `left`
 //! candles before and the `right` candles after it. A pivot is therefore only
 //! confirmed `right` candles later, which is when the detection is emitted.
+//!
+//! Search (lows; highs are the mirror):
+//! - a low **starts** a search (first pivot A) only if its RSI is at most
+//!   `rsi_low` (e.g. 30; 100 for any level);
+//! - the diverging low is searched in the **next `lookahead` lows** (e.g. 3):
+//!   a lower low with a higher RSI, at least `min_gap` after A, gives the
+//!   signal, and A is consumed;
+//! - a low with a **lower RSI than A** (not diverging) becomes the new A and
+//!   restarts the window; other lows only count;
+//! - after `lookahead` lows without divergence, A expires.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -62,28 +72,36 @@ pub struct DivergenceParams {
     pub left: usize,
     /// Candles after a pivot (confirmation delay).
     pub right: usize,
-    /// Minimum time between two compared pivots (inclusive).
+    /// Minimum time between the first pivot and the diverging one (inclusive).
     pub min_gap: TimeDelta,
-    /// Maximum time between two compared pivots (inclusive).
-    pub max_gap: TimeDelta,
+    /// A low starts a bullish search only if its RSI is at most this level
+    /// (100: any level).
+    pub rsi_low: Decimal,
+    /// A high starts a bearish search only if its RSI is at least this level
+    /// (0: any level).
+    pub rsi_high: Decimal,
+    /// Number of pivots, after the first one, in which the diverging pivot is
+    /// searched.
+    pub lookahead: usize,
 }
 
 impl DivergenceParams {
-    /// Default parameters for a timeframe: `left` = `right` = 3 candles,
-    /// `max_gap` = 60 candles and `min_gap` = 5 candles at 1m, 3 at 5m,
-    /// 2 from 15m up.
+    /// Default parameters for a timeframe: `left` = `right` = 3 candles;
+    /// `min_gap` = 5 candles at 1m, 3 at 5m, 2 from 15m up; `rsi_low` = 30,
+    /// `rsi_high` = 70; `lookahead` = 3 pivots.
     pub fn for_timeframe(timeframe: Timeframe) -> Self {
         let min_candles = match timeframe {
             Timeframe::M1 => 5,
             Timeframe::M5 => 3,
             Timeframe::M15 | Timeframe::H1 | Timeframe::H4 | Timeframe::D1 => 2,
         };
-        let candle = timeframe.duration();
         Self {
             left: 3,
             right: 3,
-            min_gap: candle * min_candles,
-            max_gap: candle * 60,
+            min_gap: timeframe.duration() * min_candles,
+            rsi_low: Decimal::from(30),
+            rsi_high: Decimal::from(70),
+            lookahead: 3,
         }
     }
 }
@@ -93,6 +111,17 @@ impl Default for DivergenceParams {
     fn default() -> Self {
         Self::for_timeframe(Timeframe::M1)
     }
+}
+
+/// A test between the first pivot A and a new pivot B.
+type PivotTest = fn(&Pivot, &Pivot) -> bool;
+
+/// Search of a divergence on one side (lows or highs): the first pivot A,
+/// and the number of pivots seen since.
+#[derive(Debug, Clone, Default)]
+struct Search {
+    first: Option<Pivot>,
+    seen: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,28 +138,27 @@ pub struct RsiDivergence {
     params: DivergenceParams,
     /// The last `left + 1 + right` candles; the candidate pivot is at `left`.
     window: VecDeque<Bar>,
-    last_min: Option<Pivot>,
-    last_max: Option<Pivot>,
+    lows: Search,
+    highs: Search,
 }
 
 impl RsiDivergence {
-    /// Create the condition. Rejects `left` or `right` = 0, a negative
-    /// `min_gap` and `min_gap > max_gap`.
+    /// Create the condition. Rejects `left`, `right` or `lookahead` = 0, a
+    /// negative `min_gap`, and RSI levels outside 0..=100.
     pub fn new(params: DivergenceParams) -> Result<Self, ParameterError> {
+        let invalid = |m: &str| Err(ParameterError::Invalid(format!("divergence: {m}")));
         if params.left == 0 || params.right == 0 {
-            return Err(ParameterError::Invalid(
-                "divergence: left and right must be >= 1".into(),
-            ));
+            return invalid("left and right must be >= 1");
         }
         if params.min_gap < TimeDelta::zero() {
-            return Err(ParameterError::Invalid(
-                "divergence: min_gap must be >= 0".into(),
-            ));
+            return invalid("min_gap must be >= 0");
         }
-        if params.min_gap > params.max_gap {
-            return Err(ParameterError::Invalid(
-                "divergence: min_gap must be <= max_gap".into(),
-            ));
+        if params.lookahead == 0 {
+            return invalid("lookahead must be >= 1");
+        }
+        let rsi = Decimal::ZERO..=Decimal::ONE_HUNDRED;
+        if !rsi.contains(&params.rsi_low) || !rsi.contains(&params.rsi_high) {
+            return invalid("rsi_low and rsi_high must be within 0..=100");
         }
         Ok(Self::unchecked(params))
     }
@@ -139,8 +167,8 @@ impl RsiDivergence {
         Self {
             params,
             window: VecDeque::with_capacity(params.left + params.right + 2),
-            last_min: None,
-            last_max: None,
+            lows: Search::default(),
+            highs: Search::default(),
         }
     }
 
@@ -160,21 +188,55 @@ impl RsiDivergence {
             })
     }
 
-    /// Compare a new pivot B with the previous pivot A of the same kind.
-    fn check(&self, previous: Option<Pivot>, b: Pivot, kind: DivergenceKind) -> bool {
-        let Some(a) = previous else {
-            return false;
-        };
-        // Measured on the pivot times: independent of the timeframe and of
-        // missing candles.
-        let gap = b.time - a.time;
-        if gap < self.params.min_gap || gap > self.params.max_gap {
-            return false;
+    /// A new pivot `b` on the side `kind` (lows: bullish, highs: bearish).
+    /// Returns the diverging pair (A, B), if any.
+    ///
+    /// - With no first pivot A, `b` becomes A if its RSI passes the level
+    ///   (`rsi_low` for lows, `rsi_high` for highs).
+    /// - With A: `b` diverges (lower low and higher RSI, or higher high and
+    ///   lower RSI, at least `min_gap` later) -> signal, A is consumed;
+    ///   otherwise, a more extreme RSI than A's makes `b` the new A (the
+    ///   window restarts); otherwise `b` counts, and A expires after
+    ///   `lookahead` pivots (then `b` may start a new search).
+    fn on_pivot(&mut self, b: Pivot, kind: DivergenceKind) -> Option<(Pivot, Pivot)> {
+        let p = self.params;
+        let (search, valid, diverges, more_extreme): (&mut Search, bool, PivotTest, PivotTest) =
+            match kind {
+                DivergenceKind::Bullish => (
+                    &mut self.lows,
+                    b.rsi <= p.rsi_low,
+                    |a, b| b.price < a.price && b.rsi > a.rsi,
+                    |a, b| b.rsi < a.rsi,
+                ),
+                DivergenceKind::Bearish => (
+                    &mut self.highs,
+                    b.rsi >= p.rsi_high,
+                    |a, b| b.price > a.price && b.rsi < a.rsi,
+                    |a, b| b.rsi > a.rsi,
+                ),
+            };
+        if let Some(a) = search.first {
+            search.seen += 1;
+            if b.time - a.time >= p.min_gap && diverges(&a, &b) {
+                *search = Search::default(); // A is consumed
+                return Some((a, b));
+            }
+            if more_extreme(&a, &b) {
+                *search = Search {
+                    first: Some(b),
+                    seen: 0,
+                };
+                return None;
+            }
+            if search.seen < p.lookahead {
+                return None;
+            }
+            *search = Search::default(); // A expires
         }
-        match kind {
-            DivergenceKind::Bullish => b.price < a.price && b.rsi > a.rsi,
-            DivergenceKind::Bearish => b.price > a.price && b.rsi < a.rsi,
+        if valid {
+            search.first = Some(b);
         }
+        None
     }
 }
 
@@ -224,10 +286,9 @@ impl Condition for RsiDivergence {
                 price: candidate.low,
                 rsi,
             };
-            if self.check(self.last_min, b, DivergenceKind::Bullish) {
-                detection = self.last_min.map(|a| (DivergenceKind::Bullish, a, b));
-            }
-            self.last_min = Some(b);
+            detection = self
+                .on_pivot(b, DivergenceKind::Bullish)
+                .map(|(a, b)| (DivergenceKind::Bullish, a, b));
         }
 
         if self.is_pivot(|b| b.high, |a, b| a > b)
@@ -238,10 +299,10 @@ impl Condition for RsiDivergence {
                 price: candidate.high,
                 rsi,
             };
-            if detection.is_none() && self.check(self.last_max, b, DivergenceKind::Bearish) {
-                detection = self.last_max.map(|a| (DivergenceKind::Bearish, a, b));
-            }
-            self.last_max = Some(b);
+            let bearish = self
+                .on_pivot(b, DivergenceKind::Bearish)
+                .map(|(a, b)| (DivergenceKind::Bearish, a, b));
+            detection = detection.or(bearish);
         }
 
         detection.map(|(kind, first, second)| Detection {
@@ -270,213 +331,225 @@ impl Condition for RsiDivergence {
 mod tests {
     use super::*;
     use crate::candle::Candle;
+    use crate::source::Mode;
     use crate::transformer::Derived;
-    use chrono::TimeDelta;
+    use chrono::{DateTime, Utc};
 
-    fn at(i: i64) -> DateTime<Utc> {
-        DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(i)
-    }
-
-    fn item(i: i64, low: i64, high: i64, rsi: Option<i64>) -> RsiCandle {
-        let (low, high) = (Decimal::from(low), Decimal::from(high));
-        Derived {
-            data: Candle {
-                open_time: at(i),
-                open: low,
-                high,
-                low,
-                close: high,
-                volume: Decimal::ONE,
-            },
-            value: rsi.map(Decimal::from),
+    /// Valleys: each is 5 candles with lows `v+4, v+2, v, v+2, v+4`; the
+    /// middle one is a low pivot (left = right = 2) with the given RSI. Highs
+    /// are `low + 1`. Other candles have RSI 50.
+    fn valleys(spec: &[(i64, i64)]) -> Vec<RsiCandle> {
+        let mut out = Vec::new();
+        for &(v, rsi) in spec {
+            for (offset, r) in [(4, 50), (2, 50), (0, rsi), (2, 50), (4, 50)] {
+                let i = out.len() as i64;
+                let low = Decimal::from(v + offset);
+                out.push(Derived {
+                    data: Candle {
+                        open_time: DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(i),
+                        open: low,
+                        high: low + Decimal::ONE,
+                        low,
+                        close: low + Decimal::ONE,
+                        volume: Decimal::ONE,
+                    },
+                    value: Some(Decimal::from(r)),
+                });
+            }
         }
+        // Closing candles so that the last valley is confirmed.
+        let last = out.last().cloned();
+        if let Some(last) = last {
+            for k in 1..=2 {
+                let mut c = last.clone();
+                c.data.open_time += TimeDelta::minutes(k);
+                c.data.low += Decimal::from(k);
+                c.data.high += Decimal::from(k);
+                out.push(c);
+            }
+        }
+        out
     }
 
-    /// Bars defined by their low (high = low + 1).
-    fn by_low(lows: &[i64], rsi: &[Option<i64>]) -> Vec<RsiCandle> {
-        (0..)
-            .zip(lows.iter().zip(rsi))
-            .map(|(i, (&l, &r))| item(i, l, l + 1, r))
+    /// Mirror prices around 500 and RSI around 50: lows become highs.
+    fn mirror(items: &[RsiCandle]) -> Vec<RsiCandle> {
+        let m = |x: Decimal| Decimal::from(500) - x;
+        items
+            .iter()
+            .map(|d| Derived {
+                data: Candle {
+                    open: m(d.data.open),
+                    high: m(d.data.low),
+                    low: m(d.data.high),
+                    close: m(d.data.close),
+                    ..d.data.clone()
+                },
+                value: d.value.map(|r| Decimal::ONE_HUNDRED - r),
+            })
             .collect()
     }
 
-    /// Bars defined by their high (low = high - 1).
-    fn by_high(highs: &[i64], rsi: &[Option<i64>]) -> Vec<RsiCandle> {
-        (0..)
-            .zip(highs.iter().zip(rsi))
-            .map(|(i, (&h, &r))| item(i, h - 1, h, r))
-            .collect()
-    }
-
-    /// Test candles are 1 minute apart: gaps given in candles = minutes.
-    fn params(min_gap: i64, max_gap: i64) -> DivergenceParams {
+    fn params() -> DivergenceParams {
         DivergenceParams {
             left: 2,
             right: 2,
-            min_gap: TimeDelta::minutes(min_gap),
-            max_gap: TimeDelta::minutes(max_gap),
+            min_gap: TimeDelta::minutes(1),
+            ..DivergenceParams::default()
         }
     }
 
-    /// Feed all items; return (index of the confirming candle, detection).
-    fn run(p: DivergenceParams, items: &[RsiCandle]) -> Vec<(usize, Detection<Divergence>)> {
+    /// (kind, A price, B price) of every detection.
+    fn run(p: DivergenceParams, items: &[RsiCandle]) -> Vec<(DivergenceKind, Decimal, Decimal)> {
         let mut cond = RsiDivergence::new(p).unwrap();
         items
             .iter()
-            .enumerate()
-            .filter_map(|(i, it)| {
+            .filter_map(|data| {
                 cond.on_data(Item {
-                    data: it,
-                    mode: crate::source::Mode::Replay,
+                    data,
+                    mode: Mode::Replay,
                 })
-                .map(|d| (i, d))
             })
+            .map(|d| (d.value.kind, d.value.first.price, d.value.second.price))
             .collect()
     }
 
-    fn s(v: &[i64]) -> Vec<Option<i64>> {
-        v.iter().copied().map(Some).collect()
+    fn bullish(items: &[RsiCandle]) -> Vec<(Decimal, Decimal)> {
+        run(params(), items)
+            .into_iter()
+            .filter(|(k, ..)| *k == DivergenceKind::Bullish)
+            .map(|(_, a, b)| (a, b))
+            .collect()
     }
 
-    // Minimum pivots at #2 (low 10) and #7 (low 8): price lower low.
-    const LOWS: [i64; 11] = [15, 14, 10, 14, 15, 13, 12, 8, 12, 13, 14];
-    // Maximum pivots at #2 (high 10) and #7 (high 12): price higher high.
-    const HIGHS: [i64; 11] = [5, 6, 10, 6, 5, 7, 8, 12, 8, 7, 6];
+    fn d(v: i64) -> Decimal {
+        Decimal::from(v)
+    }
 
     #[test]
-    fn bullish_divergence_is_emitted_on_confirmation() {
-        // RSI at #2 = 25, at #7 = 30: higher low.
-        let rsi = s(&[40, 35, 25, 35, 40, 38, 36, 30, 36, 38, 40]);
-        let out = run(params(2, 20), &by_low(&LOWS, &rsi));
-        assert_eq!(out.len(), 1);
-        let (i, d) = &out[0];
-        assert_eq!(*i, 9, "confirmed right = 2 candles after pivot #7");
-        assert_eq!(d.event_type, TriggerEventType::BullishDivergence);
-        assert_eq!(d.value.kind, DivergenceKind::Bullish);
+    fn the_first_low_must_be_oversold() {
+        // A at 100 with RSI 25 (<= 30), B lower (98) with RSI 28: divergence.
         assert_eq!(
-            (d.value.first.time, d.value.first.price),
-            (at(2), Decimal::from(10))
+            bullish(&valleys(&[(100, 25), (98, 28)])),
+            vec![(d(100), d(98))]
         );
-        assert_eq!(
-            (d.value.second.time, d.value.second.price),
-            (at(7), Decimal::from(8))
-        );
-        assert_eq!(d.value.first.rsi, Decimal::from(25));
-        assert_eq!(d.value.second.rsi, Decimal::from(30));
-        assert_eq!(d.value.confirmed_at, at(9));
+        // Same shape but A has RSI 35 (> 30): no search, no divergence.
+        assert!(bullish(&valleys(&[(100, 35), (98, 40)])).is_empty());
     }
 
     #[test]
-    fn bearish_divergence_is_emitted_on_confirmation() {
-        // RSI at #2 = 75, at #7 = 70: lower high.
-        let rsi = s(&[60, 65, 75, 65, 60, 62, 64, 70, 64, 62, 60]);
-        let out = run(params(2, 20), &by_high(&HIGHS, &rsi));
-        assert_eq!(out.len(), 1);
-        let (i, d) = &out[0];
-        assert_eq!(*i, 9);
-        assert_eq!(d.event_type, TriggerEventType::BearishDivergence);
-        assert_eq!(d.value.first.price, Decimal::from(10));
-        assert_eq!(d.value.second.price, Decimal::from(12));
+    fn the_diverging_low_is_searched_in_the_next_lookahead_lows() {
+        // A (25), then 2 higher lows that do not diverge, then B: 3rd low -> found.
+        let found = valleys(&[(100, 25), (105, 40), (106, 40), (98, 28)]);
+        assert_eq!(bullish(&found), vec![(d(100), d(98))]);
+        // B is the 4th low after A: A has expired.
+        let late = valleys(&[(100, 25), (105, 40), (106, 40), (107, 40), (98, 28)]);
+        assert!(bullish(&late).is_empty());
     }
 
     #[test]
-    fn no_divergence_when_rsi_follows_price() {
-        // RSI lower low too (25 -> 20).
-        let rsi = s(&[40, 35, 25, 35, 40, 38, 36, 20, 36, 38, 40]);
-        assert!(run(params(2, 20), &by_low(&LOWS, &rsi)).is_empty());
+    fn a_lower_rsi_restarts_the_window() {
+        // A (100, RSI 25); then 95 with RSI 20 (lower RSI: not a divergence)
+        // becomes the new A; then 93 with RSI 22 diverges from it.
+        let items = valleys(&[(100, 25), (95, 20), (93, 22)]);
+        assert_eq!(bullish(&items), vec![(d(95), d(93))]);
     }
 
     #[test]
-    fn gap_must_be_within_bounds() {
-        let rsi = s(&[40, 35, 25, 35, 40, 38, 36, 30, 36, 38, 40]);
-        let items = by_low(&LOWS, &rsi); // gap = 5
-        assert!(run(params(6, 20), &items).is_empty(), "too close");
-        assert!(run(params(2, 4), &items).is_empty(), "too far");
-        assert_eq!(run(params(5, 5), &items).len(), 1, "bounds are inclusive");
+    fn an_oversold_low_with_a_higher_rsi_does_not_replace_the_first() {
+        // A (100, RSI 25); 105 with RSI 28 (<= 30 but higher than A): counts
+        // only; 99 with RSI 27 diverges from A, not from 105.
+        let items = valleys(&[(100, 25), (105, 28), (99, 27)]);
+        assert_eq!(bullish(&items), vec![(d(100), d(99))]);
     }
 
     #[test]
-    fn nothing_before_confirmation() {
-        let rsi = s(&[40, 35, 25, 35, 40, 38, 36, 30, 36, 38, 40]);
-        let items = by_low(&LOWS, &rsi);
-        // Stop one candle before the confirmation of pivot #7.
-        assert!(run(params(2, 20), &items[..9]).is_empty());
+    fn the_first_low_is_consumed_by_a_divergence() {
+        // A (25) -> B (98, 28): signal. C (96, 29) is lower with a higher RSI
+        // than B, but no search is running (B does not start one).
+        let items = valleys(&[(100, 25), (98, 28), (96, 29)]);
+        assert_eq!(bullish(&items), vec![(d(100), d(98))]);
     }
 
     #[test]
-    fn pivot_without_rsi_is_ignored() {
-        let mut rsi = s(&[40, 35, 25, 35, 40, 38, 36, 30, 36, 38, 40]);
-        rsi[2] = None; // pivot A still warming up
-        assert!(run(params(2, 20), &by_low(&LOWS, &rsi)).is_empty());
+    fn any_level_with_100_and_0() {
+        let any = DivergenceParams {
+            rsi_low: d(100),
+            rsi_high: d(0),
+            ..params()
+        };
+        let items = valleys(&[(100, 55), (98, 58)]);
+        let found: Vec<_> = run(any, &items)
+            .into_iter()
+            .filter(|(k, ..)| *k == DivergenceKind::Bullish)
+            .collect();
+        assert_eq!(found, vec![(DivergenceKind::Bullish, d(100), d(98))]);
+        assert!(bullish(&items).is_empty(), "not with the default level 30");
     }
 
     #[test]
-    fn flat_bottom_gives_one_pivot() {
-        // #2 and #3 share the same low: only #2 is a pivot (strict left, non-strict right).
-        let lows = [15, 14, 10, 10, 15, 13, 12, 8, 12, 13, 14];
-        let rsi = s(&[40, 35, 25, 26, 40, 38, 36, 30, 36, 38, 40]);
-        let out = run(params(2, 20), &by_low(&lows, &rsi));
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1.value.first.time, at(2));
-    }
-
-    #[test]
-    fn rejects_invalid_params() {
-        let p = DivergenceParams::default();
-        assert!(RsiDivergence::new(DivergenceParams { left: 0, ..p }).is_err());
-        assert!(RsiDivergence::new(DivergenceParams { right: 0, ..p }).is_err());
+    fn highs_are_the_mirror() {
+        // Mirrored valleys: highs at 400 (RSI 75) then 402 (RSI 72).
+        let items = mirror(&valleys(&[(100, 25), (98, 28)]));
+        let bearish: Vec<_> = run(params(), &items)
+            .into_iter()
+            .filter(|(k, ..)| *k == DivergenceKind::Bearish)
+            .collect();
+        assert_eq!(bearish, vec![(DivergenceKind::Bearish, d(400), d(402))]);
+        // First high not overbought (RSI 65 < 70): nothing.
+        let weak = mirror(&valleys(&[(100, 35), (98, 40)]));
         assert!(
-            RsiDivergence::new(DivergenceParams {
-                min_gap: TimeDelta::minutes(10),
-                max_gap: TimeDelta::minutes(5),
-                ..p
-            })
-            .is_err()
+            run(params(), &weak)
+                .iter()
+                .all(|(k, ..)| *k != DivergenceKind::Bearish)
         );
-        assert!(
-            RsiDivergence::new(DivergenceParams {
-                min_gap: TimeDelta::minutes(-1),
-                ..p
-            })
-            .is_err()
-        );
-        assert!(RsiDivergence::new(p).is_ok());
+    }
+
+    #[test]
+    fn min_gap_is_respected() {
+        let far = DivergenceParams {
+            min_gap: TimeDelta::minutes(10), // valleys are 5 minutes apart
+            ..params()
+        };
+        let items = valleys(&[(100, 25), (98, 28)]);
+        assert!(run(far, &items).is_empty());
     }
 
     #[test]
     fn default_gaps_depend_on_the_timeframe() {
-        let p = |tf| DivergenceParams::for_timeframe(tf);
+        let p = DivergenceParams::for_timeframe;
         assert_eq!(p(Timeframe::M1).min_gap, TimeDelta::minutes(5));
-        assert_eq!(p(Timeframe::M1).max_gap, TimeDelta::minutes(60));
         assert_eq!(p(Timeframe::M5).min_gap, TimeDelta::minutes(15));
         assert_eq!(p(Timeframe::M15).min_gap, TimeDelta::minutes(30));
-        assert_eq!(p(Timeframe::M15).max_gap, TimeDelta::hours(15));
         assert_eq!(p(Timeframe::H1).min_gap, TimeDelta::hours(2));
         assert_eq!(DivergenceParams::default(), p(Timeframe::M1));
+        let defaults = p(Timeframe::M15);
+        assert_eq!((defaults.rsi_low, defaults.rsi_high), (d(30), d(70)));
+        assert_eq!(defaults.lookahead, 3);
     }
 
     #[test]
-    fn gap_is_measured_in_time_on_15m_candles() {
-        // Same shape as LOWS, but with 15-minute candles: pivots 5 candles = 75 min apart.
-        let rsi = s(&[40, 35, 25, 35, 40, 38, 36, 30, 36, 38, 40]);
-        let items: Vec<RsiCandle> = by_low(&LOWS, &rsi)
-            .into_iter()
-            .zip(0..)
-            .map(|(mut it, i)| {
-                it.data.open_time = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::minutes(15 * i);
-                it
-            })
-            .collect();
-        let p15 = DivergenceParams {
-            left: 2,
-            right: 2,
-            ..DivergenceParams::for_timeframe(Timeframe::M15)
-        };
-        assert_eq!(run(p15, &items).len(), 1, "75 min is within 30 min .. 15 h");
-        let strict = DivergenceParams {
-            min_gap: TimeDelta::minutes(90),
-            ..p15
-        };
-        assert!(run(strict, &items).is_empty(), "75 min < 90 min");
+    fn rejects_invalid_params() {
+        let p = params();
+        let bad = [
+            DivergenceParams { left: 0, ..p },
+            DivergenceParams { right: 0, ..p },
+            DivergenceParams {
+                min_gap: TimeDelta::minutes(-1),
+                ..p
+            },
+            DivergenceParams { lookahead: 0, ..p },
+            DivergenceParams {
+                rsi_low: d(101),
+                ..p
+            },
+            DivergenceParams {
+                rsi_high: d(-1),
+                ..p
+            },
+        ];
+        for b in bad {
+            assert!(RsiDivergence::new(b).is_err(), "{b:?}");
+        }
+        assert!(RsiDivergence::new(p).is_ok());
     }
 }

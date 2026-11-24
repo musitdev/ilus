@@ -24,9 +24,11 @@
 //! - period: `--days N` (from N days ago, 00:00 UTC, until now; default 1), or
 //!   `--from YYYY-MM-DD [--to YYYY-MM-DD]` (00:00 UTC; `--to` excluded, default now);
 //! - divergence pivots: `--left N` / `--right N` candles (default 3 / 3);
-//!   `right` is the confirmation delay; `--min-gap N` / `--max-gap N`: distance
-//!   between two compared pivots, in candles (default: 60 max; min 5 at 1m,
-//!   3 at 5m, 2 from 15m up);
+//!   `right` is the confirmation delay; `--min-gap N`: minimum distance between
+//!   the two pivots, in candles (5 at 1m, 3 at 5m, 2 from 15m up);
+//!   `--rsi-low R` / `--rsi-high R`: RSI level of the first low / high
+//!   (default 30 / 70; 100 / 0 for any level); `--lookahead N`: pivots in which
+//!   the diverging one is searched (default 3);
 //! - funding rates are ignored.
 //!
 //! The condition is wrapped so that it also emits a "tick" event for every
@@ -36,7 +38,7 @@
 //! runs as fast as possible (`--tick-ms 0`, the default here).
 //!
 //! Run with:
-//! `cargo run --example backtest_futures -- [--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N] [--right N] [--min-gap N] [--max-gap N] [--tick-ms N] [timeframe] [fees %...]`
+//! `cargo run --example backtest_futures -- [--days N | --from D [--to D]] [--leverage L] [--stop P] [--left N] [--right N] [--min-gap N] [--rsi-low R] [--rsi-high R] [--lookahead N] [--tick-ms N] [timeframe] [fees %...]`
 //! e.g. `cargo run --example backtest_futures -- --days 7 --stop 3 15m 0 0.05 0.2`
 
 #[path = "support/futures.rs"]
