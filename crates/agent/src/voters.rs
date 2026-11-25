@@ -8,6 +8,7 @@ use trading::candle::{Candle, CandleData};
 use trading::condition::divergence::{DivergenceKind, DivergenceParams, Pivots, RsiDivergence};
 use trading::condition::ema_rules::{EmaCross, EmaPair};
 use trading::condition::patterns::PatternCondition;
+use trading::condition::volume::VolumeSpike;
 use trading::condition::{Condition, Signal};
 use trading::error::{ModifierError, ParameterError};
 use trading::modifier::NoModifier;
@@ -74,8 +75,8 @@ macro_rules! no_modifier {
 pub struct DivergenceVoter {
     divergence: RsiDivergence,
     pivots: Pivots,
-    exit_high: Decimal,
-    exit_low: Decimal,
+    /// RSI exit levels (high, low); `None`: no exit ballot.
+    exits: Option<(Decimal, Decimal)>,
     active: Option<Active>,
 }
 
@@ -96,8 +97,19 @@ impl DivergenceVoter {
         Ok(Self {
             divergence: RsiDivergence::new(params)?,
             pivots: Pivots::new(params.left, params.right),
-            exit_high,
-            exit_low,
+            exits: Some((exit_high, exit_low)),
+            active: None,
+        })
+    }
+
+    /// Divergences with an indicator that has no levels (e.g. the OBV):
+    /// any pivot can start a divergence (`rsi_low` / `rsi_high` ignored),
+    /// and no exit ballot (the indicator has no overbought / oversold).
+    pub fn indicator(params: DivergenceParams) -> Result<Self, ParameterError> {
+        Ok(Self {
+            divergence: RsiDivergence::any_level(params)?,
+            pivots: Pivots::new(params.left, params.right),
+            exits: None,
             active: None,
         })
     }
@@ -132,11 +144,13 @@ impl Condition for DivergenceVoter {
             self.active = None;
             ballots.push(Ballot::Revoke);
         }
-        if pivots.high.is_some_and(|p| p.rsi > self.exit_high) {
-            ballots.push(Ballot::Exit(Side::Long));
-        }
-        if pivots.low.is_some_and(|p| p.rsi < self.exit_low) {
-            ballots.push(Ballot::Exit(Side::Short));
+        if let Some((high, low)) = self.exits {
+            if pivots.high.is_some_and(|p| p.rsi > high) {
+                ballots.push(Ballot::Exit(Side::Long));
+            }
+            if pivots.low.is_some_and(|p| p.rsi < low) {
+                ballots.push(Ballot::Exit(Side::Short));
+            }
         }
         detection(event_type, ballots)
     }
@@ -267,6 +281,63 @@ impl Condition for PatternVoter {
                 (false, true) => Side::Short,
                 _ => return None,
             };
+            let level = match s {
+                Side::Long => c.low,
+                Side::Short => c.high,
+            };
+            self.active = Some(Active { side: s, level });
+            return detection(
+                d.event_type,
+                vec![Ballot::Open(s), Ballot::Exit(s.opposite())],
+            );
+        }
+        if self.active.is_some_and(|a| a.broken(c.close)) {
+            self.active = None;
+            return detection(TriggerEventType::Other("ballots"), vec![Ballot::Revoke]);
+        }
+        None
+    }
+
+    no_modifier!();
+}
+
+// ------------------------------------------------------------ volume spike
+
+/// Volume spike rule (input: candles + their mean volume, see
+/// [`VolumeMean`](trading::transformer::volume::VolumeMean)).
+/// - Open: a spike on a green candle → long, on a red candle → short; the
+///   opposite replaces the vote.
+/// - Revoke: the close breaks the low (long) / high (short) of the spike
+///   candle.
+/// - Exit: an opposite spike.
+pub struct VolumeSpikeVoter {
+    spike: VolumeSpike,
+    active: Option<Active>,
+}
+
+impl VolumeSpikeVoter {
+    /// Vote on the spikes detected by `spike`.
+    pub fn new(spike: VolumeSpike) -> Self {
+        Self {
+            spike,
+            active: None,
+        }
+    }
+}
+
+impl Condition for VolumeSpikeVoter {
+    type Input = Derived<Candle, Decimal>;
+    type Value = Ballots;
+    type Modifier = NoModifier;
+
+    fn warm_up(&self) -> usize {
+        self.spike.warm_up()
+    }
+
+    fn on_data(&mut self, item: Item<'_, Self::Input>) -> Option<Detection<Ballots>> {
+        let c = &item.data.data;
+        if let Some(d) = self.spike.on_data(item) {
+            let s = side(d.value.signal);
             let level = match s {
                 Side::Long => c.low,
                 Side::Short => c.high,
@@ -522,6 +593,45 @@ mod tests {
         assert_eq!(
             run(&mut only(Pattern::ShootingStar), &mirror(&series)),
             vec![(25, vec![Open(Short), Exit(Long)]), (27, vec![Revoke])]
+        );
+    }
+
+    #[test]
+    fn volume_spike_voter_opens_revokes_and_exits() {
+        // (open, close, volume, mean): low = min(open, close).
+        let bars = [
+            (10, 11, 100, Some(100)), // no spike
+            (11, 13, 300, Some(100)), // green spike: long, level = low 11
+            (13, 12, 100, Some(150)), // close 12 >= 11: kept
+            (12, 10, 100, Some(150)), // close 10 < 11: revoked
+            (10, 9, 500, Some(150)),  // red spike: short (exit long)
+        ];
+        let items: Vec<Derived<Candle, Decimal>> = bars
+            .iter()
+            .enumerate()
+            .map(|(i, &(o, c, v, m))| {
+                let (o, c) = (Decimal::from(o), Decimal::from(c));
+                Derived {
+                    data: Candle {
+                        open_time: time(i),
+                        open: o,
+                        high: o.max(c),
+                        low: o.min(c),
+                        close: c,
+                        volume: Decimal::from(v),
+                    },
+                    value: m.map(Decimal::from),
+                }
+            })
+            .collect();
+        let mut v = VolumeSpikeVoter::new(VolumeSpike::new(dec!(2)).unwrap());
+        assert_eq!(
+            run(&mut v, &items),
+            vec![
+                (1, vec![Open(Long), Exit(Short)]),
+                (3, vec![Revoke]),
+                (4, vec![Open(Short), Exit(Long)]),
+            ]
         );
     }
 }

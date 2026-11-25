@@ -674,7 +674,7 @@ A trading agent combines several **rules**. Each rule is an ordinary chain of th
 
 **Other timeframes** (`Projected`): a voter on a longer timeframe reads the output of an `Aggregate` (e.g. 15m → 1h) followed by `OnValue(Rsi)`; `Projected` runs the voter on the aggregated candle and its RSI, **only when the aggregated candle is new** (the aggregate repeats it on every 15m candle). Aggregating the trading source keeps the timeframes aligned in replay (two sources are not time-aligned there). The source bootstrap should be raised with `with_bootstrap` to cover the longer timeframe's warm-up.
 
-**Test agent** (`backtest_agent` example): 15m and 1h divergences, a fast / slow EMA cross, a trend vote and the 13 patterns on 15m, fixed weights and thresholds, the futures simulation account (stop-loss and liquidation as a safety net, fees).
+**Test agent** (`backtest_agent` example): the 15m divergence, a fast / slow EMA cross, a trend vote, the 13 patterns, a volume spike, an OBV cross and an OBV divergence on 15m, fixed weights and thresholds, the futures simulation account (stop-loss and liquidation as a safety net, fees).
 
 **Acceptance criteria**
 - [ ] Each voter emits its open, revoke and exit ballots on the criteria of the table, and nothing otherwise.
@@ -687,15 +687,19 @@ A trading agent combines several **rules**. Each rule is an ordinary chain of th
 
 Crate `agent`. The evolutionary algorithm calls `simulate(genome, candles, config)` to get the **fitness** of a genome: the **gain in %** of a simulated futures account traded by the agent of that genome.
 
-**Genome**: a vector of `GENOME_LEN` (26) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
+**Genome**: a vector of `GENOME_LEN` (29) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
 
 | Genes | Range (step) |
 |---|---|
-| open / exit weight of each rule (div 15m, div 1h, EMA cross, trend, patterns): 10 genes | 0 – 5 (0.25) |
+| open / exit weight of each rule (div 15m, EMA cross, trend, patterns, volume spike, OBV cross, OBV divergence): 14 genes | 0 – 5 (0.25) |
 | open threshold, exit threshold | 0.25 – 10 (0.25) |
-| per divergence (15m, 1h): RSI low, RSI high, lookahead, RSI exit high, RSI exit low | 20 – 50, 50 – 80, 1 – 6, 60 – 90, 10 – 40 (1) |
+| 15m divergence: RSI low, RSI high, lookahead, RSI exit high, RSI exit low | 20 – 50, 50 – 80, 1 – 6, 60 – 90, 10 – 40 (1) |
 | EMA fast period; slow = fast + gap; trend EMA period | 5 – 50, gap 1 – 150, 20 – 300 (1) |
 | stop-loss % of the entry price (replaces the one of the settings) | 1 – 10 (0.5) |
+| volume spike: mean period N, factor k | 5 – 100 (1), 1.5 – 5 (0.25) |
+| OBV cross: EMA period; OBV divergence: lookahead | 5 – 100 (1), 1 – 6 (1) |
+
+The 1h divergence was removed from the genome (7 genes): an ablation (per-month evolution, 12 months, each rule removed in turn) showed no contribution (mean score 134.4 without it against 131.5 with it; only removing the 15m divergence lowered the score, to 122.0). Its voter and `Projected` stay available.
 
 Fixed (not genes): RSI 14, pivots `left` / `right` 3, divergence `min_gap` 2 candles of its timeframe, the default pattern thresholds.
 
@@ -763,11 +767,39 @@ The network is trained on months labelled by a good strategy **for that month**:
 - **Files** (example `export_months`, directory `--out`):
   - `YYYY-MM.csv`: `open_time_ms,open,high,low,close,volume,action,position`, one line per 15m candle of the month;
   - `YYYY-MM_events.csv`: `time_ms,action,side,price,equity`, the agent's trades;
-  - `months.csv`: per month the score, gain %, positions, stops, liquidations, lowest equity, best random score, margin, genomes evaluated, the 26 genes and the decoded parameters.
+  - `months.csv`: per month the score, gain %, positions, stops, liquidations, lowest equity, best random score, margin, genomes evaluated, the genes and the decoded parameters.
 
 **Acceptance criteria**
 - [ ] Each candle gets the actions at its time, in order, and the position after them; candles before the first trade are flat.
 - [ ] The CSV files have the documented columns.
+
+### F13 — Volume rules
+
+The candle volume (base asset, e.g. SOL) is already part of every `Candle`; the rules watch its changes, not its value in quote currency.
+
+**Transformers** (`transformer::volume`):
+- `VolumeMean(N)`: the mean volume of the N candles **before** the current one.
+- `Obv`: On-Balance Volume: 0 at the first candle, then + the volume when the close is above the previous close, − below, unchanged when equal. Output: candle + OBV (the shape of an RSI candle).
+- `ObvEma(n)`: the OBV and its EMA of n, as a pair (the input of a cross rule).
+
+**Condition** `VolumeSpike(k)` (`condition::volume`): the volume of the candle is more than k (> 1) times its `VolumeMean`; bullish on a candle closing above its open, bearish below, none for a doji.
+
+**Voters** (F9):
+
+| Voter | Open | Revoke | Exit |
+|---|---|---|---|
+| `VolumeSpikeVoter` | spike on a green candle → long, red → short (the opposite replaces the vote) | the close breaks the spike candle's low (long) / high (short) | an opposite spike |
+| OBV cross (`EmaCrossVoter` on `ObvEma`) | OBV crosses above its EMA → long, below → short | — | the opposite cross |
+| OBV divergence (`DivergenceVoter::indicator` on `Obv`) | price / OBV divergence on the pivots (bullish → long, bearish → short) | the close breaks the B pivot | none |
+
+**Divergences with an indicator without levels** (`RsiDivergence::any_level`, `DivergenceVoter::indicator`): any pivot can be the first one (`rsi_low` / `rsi_high` ignored: the OBV has no 30 / 70) and the voter emits no exit ballot.
+
+**Acceptance criteria**
+- [ ] `VolumeMean` averages the N previous volumes; `Obv` adds / subtracts the volume on up / down closes; `ObvEma` pairs the OBV with its EMA.
+- [ ] `VolumeSpike` triggers above k × the mean only, in the direction of the candle.
+- [ ] The spike voter opens, revokes on the broken extreme and exits on an opposite spike.
+- [ ] `any_level` divergences start from any pivot; the indicator voter emits no exit.
+- [ ] On real candles, the votes of the three volume rules equal an independent computation (OBV, mean volume, pivots).
 
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.

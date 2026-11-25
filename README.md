@@ -104,6 +104,8 @@ Key properties:
   - `Macd`: MACD line, signal line and histogram (default 12 / 26 / 9).
   - `Trend`: EMA of the closes and the trend side (close above / below it),
     on any item containing a candle.
+  - Volume: `VolumeMean` (mean volume of the previous N candles), `Obv`
+    (On-Balance Volume), `ObvEma` (OBV and its EMA).
   - `Aggregate`: builds candles of a longer timeframe (e.g. 1m → 5m); only
     complete periods are sent.
   - `Combine`: runs 2 or 3 transformers on the same input as one node.
@@ -132,6 +134,8 @@ Key properties:
 
     Lows and highs are *pivots* (`left` / `right` candles around them).
     Defaults depend on the timeframe (`DivergenceParams::for_timeframe`).
+  - `VolumeSpike`: the volume is more than k times its mean, in the
+    direction of the candle.
   - `TrendFilter`: wraps any condition; only its signals in the trend
     direction pass (EMA rule 3).
   - `Projected`: runs a condition on a part of its input, once per new part
@@ -145,7 +149,7 @@ Key properties:
   clears every ballot after a decision. Weights, thresholds and rule
   parameters are the genes of a later selection algorithm.
 - **Agent simulation** (crate `agent`, `simulate`): the fitness of a genome
-  (26 genes in [0, 1] decoded into the agent's parameters): the agent runs on
+  (29 genes in [0, 1] decoded into the agent's parameters): the agent runs on
   15m candles given in memory and trades a simulated futures account
   (`account::Account`); the result is the gain in %, with every trade event.
 - **Evolution** (crate `select`, `evolve`): genetic algorithm on genomes with
@@ -305,13 +309,14 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |
 
 **`backtest_agent`** (test multi-rule agent, 15m): fetches the candles from
-Binance once, then runs `agent::simulate`: five rules vote (15m and 1h RSI
-divergences, EMA cross, trend, the 13 patterns), the decision trades the
+Binance once, then runs `agent::simulate`: seven rules vote (15m RSI
+divergence, EMA cross, trend, the 13 patterns, volume spike, OBV cross, OBV
+divergence), the decision trades the
 simulated futures account. Hand-written parameters, or any genome with
 `--genome`:
 
 ```sh
-cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g26] [--events]
+cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g29] [--events]
 ```
 
 **`evolve`** (crate `select`): evolves agent genomes on SOL/USDT 15m, on
@@ -435,6 +440,7 @@ crates/trading/            the engine (lib name `trading`)
     transformer/aggregate.rs  aggregation (1m -> 5m, ...)
     transformer/combine.rs    combined transformer and adapters
     transformer/trend.rs      trend (close vs EMA)
+    transformer/volume.rs     volume mean, OBV, OBV + EMA
     transformer/chart.rs chart transformer + window (feature `chart`)
     condition.rs        Condition trait
     condition/divergence.rs  RSI divergence condition
@@ -442,6 +448,7 @@ crates/trading/            the engine (lib name `trading`)
     condition/ema_rules.rs   EMA buy / sell rules
     condition/filter.rs      trend filter
     condition/projected.rs   condition on a part of the input (other timeframe)
+    condition/volume.rs      volume spike
     trigger.rs          Detection, TriggerEvent
     action.rs           Action trait, ActionContext, Alert
     modifier.rs         modifiers and handles
@@ -458,7 +465,7 @@ crates/agent/              the multi-rule agent
   src/account.rs        simulated futures account
   src/candles.rs        candles: fetch from Binance once, CSV read / write
   src/dataset.rs        candles labelled with an agent's trades (training data)
-  src/genome.rs         genome (26 genes) <-> AgentParams
+  src/genome.rs         genome (29 genes) <-> AgentParams
   src/simulate.rs       simulate: the fitness of a genome
   examples/backtest_agent.rs  test agent on the futures simulation
   tests/agent.rs        votes triggering the decision in the same tick

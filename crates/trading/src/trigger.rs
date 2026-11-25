@@ -53,6 +53,8 @@ pub enum TriggerEventType {
     EmaRibbon,
     /// MACD crossing its signal line (EMA rule 6).
     MacdCross,
+    /// Volume spike (volume > factor × its mean).
+    VolumeSpike,
     /// Any other kind of detection, identified by name.
     Other(&'static str),
 }

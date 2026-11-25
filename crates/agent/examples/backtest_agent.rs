@@ -1,14 +1,16 @@
 //! Test agent (spec F9, F10) on SOL/USDT 15m history from Binance.
 //!
 //! 1. Fetch the candles once ([`agent::candles::fetch_binance`]).
-//! 2. Simulate the agent with [`agent::simulate`]: five rules (15m and 1h
-//!    divergences, EMA cross, trend, candlestick patterns) vote, the
+//! 2. Simulate the agent with [`agent::simulate`]: seven rules (15m
+//!    divergence, EMA cross, trend, candlestick patterns, volume spike, OBV
+//!    cross, OBV divergence) vote, the
 //!    decision trades a simulated futures account.
 //!
 //! Without `--genome`, hand-written parameters are used: weights open / exit
-//! div15 2 / 1, div1h 3 / 1, EMA 9/21 1 / 1, trend EMA 50 1 / 1, patterns
-//! 1 / 0.5; thresholds open 3, exit 2; divergences RSI 30 / 70, lookahead 3,
-//! RSI exit 75 / 30.
+//! div15 2 / 1, EMA 9/21 1 / 1, trend EMA 50 1 / 1, patterns 1 / 0.5, volume
+//! spike (20 candles, x3) 1 / 0.5, OBV x EMA 20 1 / 1, OBV divergence
+//! (lookahead 3) 1 / 0; thresholds open 3, exit 2; divergence RSI 30 / 70,
+//! lookahead 3, RSI exit 75 / 30; stop 3 %.
 //!
 //! `cargo run --release --example backtest_agent -- [--days N] [--leverage L]
 //! [--stop P] [--fee F] [--genome g1,g2,...] [--events]`
@@ -37,20 +39,25 @@ fn hand_params() -> AgentParams {
     };
     AgentParams {
         div15: w(dec!(2), dec!(1)),
-        div1h: w(dec!(3), dec!(1)),
         ema: w(dec!(1), dec!(1)),
         trend: w(dec!(1), dec!(1)),
         patterns: w(dec!(1), dec!(0.5)),
+        spike: w(dec!(1), dec!(0.5)),
+        obv_cross: w(dec!(1), dec!(1)),
+        obv_div: w(dec!(1), dec!(0)),
         decision: DecisionParams {
             open_threshold: dec!(3),
             exit_threshold: dec!(2),
         },
         div15_rule: div,
-        div1h_rule: div,
         ema_fast: 9,
         ema_slow: 21,
         trend_period: 50,
         stop_pct: dec!(3),
+        spike_period: 20,
+        spike_factor: dec!(3),
+        obv_ema: 20,
+        obv_lookahead: 3,
     }
 }
 

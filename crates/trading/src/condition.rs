@@ -5,6 +5,7 @@ pub mod ema_rules;
 pub mod filter;
 pub mod patterns;
 pub mod projected;
+pub mod volume;
 
 /// Direction of a signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

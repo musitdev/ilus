@@ -48,8 +48,8 @@ fn config(leverage: Decimal, stop: Option<Decimal>, fee: Decimal) -> SimConfig {
 /// A genome that trades: moderate weights and thresholds.
 fn trading_genome() -> Vec<f64> {
     let mut g = vec![0.5; GENOME_LEN];
-    g[10] = 0.2; // open threshold ~2.25
-    g[11] = 0.1; // exit threshold ~1.25
+    g[14] = 0.2; // open threshold ~2.25
+    g[15] = 0.1; // exit threshold ~1.25
     g
 }
 
@@ -128,7 +128,7 @@ fn deterministic() {
 fn zero_weights_never_trade() {
     let candles = load();
     let mut g = vec![0.5; GENOME_LEN];
-    for w in g.iter_mut().take(10) {
+    for w in g.iter_mut().take(14) {
         *w = 0.0;
     }
     let r = simulate(&g, &candles, &config(dec!(2), None, dec!(0.05))).unwrap();

@@ -13,6 +13,7 @@ pub mod ema;
 pub mod macd;
 pub mod rsi;
 pub mod trend;
+pub mod volume;
 
 use std::fmt;
 
