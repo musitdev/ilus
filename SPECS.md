@@ -7,7 +7,21 @@ ilus is a market-monitoring bot that fetches market data from **sources**, detec
 
 Two extra concepts make the pipeline flexible: **transformers** derive new sources from existing ones (e.g. an RSI source computed from a price source), and **modifiers** let an action send information back to a condition to change how it operates.
 
-ilus is **not a trading-strategy engine**. It does not model strategies in terms of buy/sell signals, positions, or portfolio management. Its core abstraction is generic: *condition → action*. Placing an order is just one possible action among others (e.g. sending a notification, logging, calling a webhook).
+The **engine** (crate `trading`) is not a trading-strategy engine: it does not model strategies in terms of buy/sell signals, positions, or portfolio management. Its core abstraction is generic: *condition → action*. Placing an order is just one possible action among others (e.g. sending a notification, logging, calling a webhook).
+
+**Project goal.** Find agents that trade well, to train a deep network that will trade in the end:
+1. A multi-rule **agent** (F9) is defined by its **genome**: the parameters of its rules, their weights and the decision thresholds.
+2. An **evolutionary algorithm** searches genomes and keeps the agents that trade well (on simulated futures).
+3. Many good agents generate training data: the candles and their **buy / sell events**.
+4. A **deep network** is trained on that data, then used to trade. *(Later; not specified yet.)*
+
+**Crates** (Cargo workspace, `crates/`):
+
+| Crate | Content |
+|---|---|
+| `trading` | the engine: graph, executor, sources, transformers, conditions, actions, modifiers, chart (feature `chart`) |
+| `agent` | the multi-rule agent: voters, `SendVotes`, `Decision` (F9) |
+| `select` | the evolutionary search of agent genomes (F11) |
 
 ## 2. Goals
 - Fetch market data through pluggable **sources**. A default source is provided: a free, public crypto price/volume feed with 1-minute precision.
@@ -668,6 +682,92 @@ A trading agent combines several **rules**. Each rule is an ordinary chain of th
 - [ ] The decision opens on the net score reaching the threshold, exits on the exit score, ignores the ballots that do not fit its state, decides at most once per candle and clears every ballot after a decision or `Closed`.
 - [ ] `Projected` runs its condition once per new aggregated candle.
 - [ ] In a graph, votes sent within a tick trigger the decision in the same tick.
+
+### F10 — Agent simulation (fitness of a genome)
+
+Crate `agent`. The evolutionary algorithm calls `simulate(genome, candles, config)` to get the **fitness** of a genome: the **gain in %** of a simulated futures account traded by the agent of that genome.
+
+**Genome**: a vector of `GENOME_LEN` (26) genes in [0, 1]. Each gene maps to a fixed range with a step: `value = min + round(g × steps) × step` (exact `Decimal` values; only the gene is a float). Genes outside [0, 1] are clamped; NaN is an error. `AgentParams::decode` / `encode` convert between a genome and typed parameters (printable).
+
+| Genes | Range (step) |
+|---|---|
+| open / exit weight of each rule (div 15m, div 1h, EMA cross, trend, patterns): 10 genes | 0 – 5 (0.25) |
+| open threshold, exit threshold | 0.25 – 10 (0.25) |
+| per divergence (15m, 1h): RSI low, RSI high, lookahead, RSI exit high, RSI exit low | 20 – 50, 50 – 80, 1 – 6, 60 – 90, 10 – 40 (1) |
+| EMA fast period; slow = fast + gap; trend EMA period | 5 – 50, gap 1 – 150, 20 – 300 (1) |
+| stop-loss % of the entry price (replaces the one of the settings) | 1 – 10 (0.5) |
+
+Fixed (not genes): RSI 14, pivots `left` / `right` 3, divergence `min_gap` 2 candles of its timeframe, the default pattern thresholds.
+
+**Simulation settings** (`SimConfig`, not genes): `from`, `to` (excluded), the account: capital (quote currency), leverage, stop-loss %, fee % (on the position size, per open and per close).
+
+**Candles**: 15m, given by the caller (loaded once; no network in the simulation), run through a `MockSource`. The candles before `from` are the bootstrap; at least `history_needed(params)` of them are required (error otherwise). The 1h candles are aggregated from the 15m ones.
+
+**Account** (`account::Account`): one position at a time with the whole equity as margin (`margin = equity / (1 + leverage × fee)`), opened / closed at the close of the decision candle; stop-loss filled at its level (or at the open on a gap); liquidation when the equity at the worst price of a candle falls to the maintenance margin (0.5 % of the notional): equity 0, no more trading. Funding is ignored. When the stop-loss or a liquidation closes the position, or a position cannot be opened, the account sends `Closed` to the decision.
+
+**Result** (`SimResult`): the decoded parameters and the account summary: gain % (the fitness; an open position is marked at the last close), final and lowest equity, number of events, stops, liquidations, fees, and **every trade event** (time, open long / short or close with its reason, price, equity): the training data of the later network.
+
+Each call builds and runs its own executor: simulations can run in parallel threads (not from inside an async task).
+
+**Acceptance criteria**
+- [ ] A genome decodes to the documented ranges; out-of-range genes are clamped, NaN and a wrong length are errors; encode then decode gives the same parameters.
+- [ ] The account computes margin, fees, P&L, stop-loss fills and liquidation as specified.
+- [ ] On real candles, the equity recomputed from the events equals the account's, the events alternate open / close, and the gain is consistent with the final equity.
+- [ ] A simulation is deterministic; zero weights never trade; too little history or invalid settings are errors.
+
+### F11 — Evolution of agent genomes
+
+Crate `select`. `evolve(len, config, fitness)` runs a genetic algorithm on genomes of `len` genes in [0, 1]; `fitness` is any function (in practice `agent::simulate`, fitness = gain %). Deterministic: the random generator (SplitMix64) is seeded by `config.seed`.
+
+- **Generation 0**: `population` random genomes (uniform in [0, 1]).
+- **Evaluation**: each genome not evaluated before is evaluated, in parallel threads (one per genome); a known genome keeps its score (the simulation is deterministic on a fixed period). A fitness error stops the evolution with that error.
+- **Ranking** by fitness, best first.
+- **Next generation** (settings are parameters, to be tested):
+  - the `elite` best are kept unchanged;
+  - each other slot `k` (rank order) gets a child of the genome of that rank: with probability `crossover`, a uniform crossover with a tournament winner (`tournament` random picks, the best ranked wins); then each gene mutates with probability `mutation_rate`, by a Gaussian of strength `sigma` growing linearly with the rank, from `sigma_min` (best non-elite) to `sigma_max` (worst); genes are clamped to [0, 1].
+- **Stop**: after `generations`, or when the best fitness improved by less than `min_improvement` over the last `patience` generations (`patience` 0: never).
+- **Report**: generations run, stop reason, best fitness per generation, the last population with scores, the number of evaluations, and the **history of every genome of every generation** (generation, rank, origin random / elite / child, sigma, evaluated or known, score and details).
+
+Defaults: population 10, generations 50, elite 2, mutation rate 0.3, sigma 0.02 – 0.25, crossover 0.7, tournament 3, patience 10, min improvement 0.5, seed 1.
+
+**Cross-validation score** (`select::score`, used by `evolve --months`):
+- **Month score**: `gain − penalty × (1 − activity)`; the activity is 1 when the agent opens between `low` and `high` positions per day (`--trades-per-day 1:2`, the target), `rate / low` below (0 without any position: the full penalty), `high / rate` above; `penalty` = `--activity-penalty` (20 gain points). Gains and losses count in full; more trades towards the target increase the score.
+- **Folds**: `--folds` (4) splits of the `--months` (12) months into 6 train / 6 test months, built in pairs (A/B then B/A, two different shuffles, seeded by `--fold-seed`): each month is a training month in exactly half of the folds, and the training sets differ.
+- **Fold score**: `mean(train) − gap_weight × |mean(train) − mean(test)|` (`--gap-weight`, default 1): the difference between the training and test months is minimised.
+- **Fitness**: the mean of the fold scores. Every month is used by the fitness; `--test` periods are then a **holdout**, never used for selection.
+
+**Random trader** (`select::baseline::RandomTrader`, the baseline): on each candle, when flat it opens with probability `p_open` on a random side, in position it closes with probability `p_close` (at the close); same account as the agents. Deterministic for its seed.
+
+**Example `compare_months`**: for each calendar month (candles from a CSV, e.g. saved by `evolve --save`), with the month score: the best of N random traders (1.5 positions per day, stop-loss drawn in the gene's range; N = the number of genomes evaluated by the full evolution of that month), the best agent evolved with the 15m divergence only (the other rules' weights at 0) and the best agent evolved with all the rules.
+
+**Example `evolve`**: SOL/USDT 15m.
+- Periods: `--train FROM:TO` (repeatable): the fitness is the **mean** (`--combine mean`, default) or the **worst** (`--combine min`) of the gains on the training periods (e.g. a bull and a bear month); `--test FROM:TO` (repeatable): only measured on the final population, never used for selection. Without `--train`: the last `--days` (30) days.
+- Cross-validation mode: `--months N --start YYYY-MM-01` (one period per calendar month), with the score above.
+- The stop-loss is a gene (F10); the account settings are the leverage and the fee.
+- Candles: every period plus the longest warm-up any genome can need, fetched once from Binance (or `--candles file.csv`, saved with `--save`).
+- Prints the best and mean fitness of each generation and the final population (fitness, gain / events / stops on each training and test period, parameters, `--genome` line for `backtest_agent`); writes the history to a CSV file (`--history`: one line per genome and generation, with the gain, events and stops of each training period, the genes and the decoded parameters).
+
+**Acceptance criteria**
+- [ ] With elitism, the best fitness never decreases; on a simple test fitness it improves towards the optimum.
+- [ ] The history holds every genome of every generation with its rank and origin; elites are not evaluated again.
+- [ ] The mutation strength goes from `sigma_min` to `sigma_max` with the rank.
+- [ ] Same seed, same run; the early stop triggers on a flat fitness; invalid settings and fitness errors are errors.
+
+### F12 — Training data per month
+
+The network is trained on months labelled by a good strategy **for that month**: fitting one month is the goal here, not a defect.
+
+- **Per month** (`select::month::evolve_month`): the agents (all the rules) are evolved on that month with the month score (F11); the best genome is kept, always (no filter).
+- **Margin over luck** (`select::month::best_random`): the best of N random traders (N = the genomes evaluated by the evolution, same month score) is recorded with the month: `margin = agent score − best random score`.
+- **Labels** (`agent::dataset::label`): each candle of the month gets the actions taken at its close, in order (`buy`: open long, `sell`: open short, `close_exit`, `close_stop`, `close_liquidation`; several joined with `+`, e.g. `close_stop+sell`) and the position after it (`long`, `short`, `flat`).
+- **Files** (example `export_months`, directory `--out`):
+  - `YYYY-MM.csv`: `open_time_ms,open,high,low,close,volume,action,position`, one line per 15m candle of the month;
+  - `YYYY-MM_events.csv`: `time_ms,action,side,price,equity`, the agent's trades;
+  - `months.csv`: per month the score, gain %, positions, stops, liquidations, lowest equity, best random score, margin, genomes evaluated, the 26 genes and the decoded parameters.
+
+**Acceptance criteria**
+- [ ] Each candle gets the actions at its time, in order, and the position after them; candles before the first trade are flat.
+- [ ] The CSV files have the documented columns.
 
 ## 8. Interfaces
 - **Configuration**: none. Rules are defined in Rust code (`main.rs` or a `rules` module). Changing rules requires a rebuild.

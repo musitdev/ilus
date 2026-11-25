@@ -136,7 +136,7 @@ Key properties:
     direction pass (EMA rule 3).
   - `Projected`: runs a condition on a part of its input, once per new part
     (e.g. a 1h divergence on candles aggregated from 15m).
-- **Multi-rule agent** (`agent`): each rule is a chain ending with a *voter*
+- **Multi-rule agent** (crate `agent`): each rule is a chain ending with a *voter*
   condition (`DivergenceVoter`, `EmaCrossVoter`, `TrendVoter`,
   `PatternVoter`) that emits open / revoke / exit ballots; its `SendVotes`
   action sends them, with the rule's weights, as modifiers to one `Decision`
@@ -144,6 +144,14 @@ Key properties:
   threshold, exits when the exit score does, at most once per candle, and
   clears every ballot after a decision. Weights, thresholds and rule
   parameters are the genes of a later selection algorithm.
+- **Agent simulation** (crate `agent`, `simulate`): the fitness of a genome
+  (26 genes in [0, 1] decoded into the agent's parameters): the agent runs on
+  15m candles given in memory and trades a simulated futures account
+  (`account::Account`); the result is the gain in %, with every trade event.
+- **Evolution** (crate `select`, `evolve`): genetic algorithm on genomes with
+  any fitness: elites kept, children by crossover and rank-dependent mutation
+  (little for the best, a lot for the worst), parallel evaluation, early
+  stop, deterministic seed, full history of every genome.
 - **Actions**
   - `Alert`: prints the trigger event. Works with any condition.
 
@@ -160,20 +168,20 @@ The Binance examples need internet access. The chart example needs a desktop
 session (X11 or Wayland).
 
 ```sh
-cargo build
-cargo test
+cargo build --workspace
+cargo test --workspace
 ```
 
 ### Minimal graph
 
 ```rust
-use ilus::action::Alert;
-use ilus::condition::divergence::{DivergenceParams, RsiDivergence};
-use ilus::executor::Executor;
-use ilus::graph::Graph;
-use ilus::source::Timeframe;
-use ilus::source::binance::BinanceSource;
-use ilus::transformer::rsi::Rsi;
+use trading::action::Alert;
+use trading::condition::divergence::{DivergenceParams, RsiDivergence};
+use trading::executor::Executor;
+use trading::graph::Graph;
+use trading::source::Timeframe;
+use trading::source::binance::BinanceSource;
+use trading::transformer::rsi::Rsi;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut g = Graph::new();
@@ -296,14 +304,59 @@ cargo run --example backtest_futures -- --from 2026-09-22 --to 2026-09-29 --stop
 | `timeframe` | `1m` `5m` `15m` `1h` `4h` `1d` | `1m` |
 | `fees %...` | one simulation per fee (on position size, per transaction) | 0 |
 
-**`backtest_agent`** (test multi-rule agent, 15m): five rules vote (15m and
-1h RSI divergences, EMA 9/21 cross, trend EMA 50, the 13 patterns) with
-fixed weights; the decision trades on the futures simulation account (the
-stop-loss stays as a safety net). Same options as `backtest_futures` for the
-period, leverage, stop, divergences, RSI exits and fees:
+**`backtest_agent`** (test multi-rule agent, 15m): fetches the candles from
+Binance once, then runs `agent::simulate`: five rules vote (15m and 1h RSI
+divergences, EMA cross, trend, the 13 patterns), the decision trades the
+simulated futures account. Hand-written parameters, or any genome with
+`--genome`:
 
 ```sh
-cargo run --release --example backtest_agent -- --days 60 --leverage 2 --stop 3 15m 0.05
+cargo run --release --example backtest_agent -- [--days N] [--leverage L] [--stop P] [--fee F] [--genome g1,...,g26] [--events]
+```
+
+**`evolve`** (crate `select`): evolves agent genomes on SOL/USDT 15m, on
+training periods (`--train FROM:TO`, repeatable, e.g. a bull and a bear
+month; fitness: mean or worst gain with `--combine mean|min`; default: the
+last month), and measures the final population on test periods never used
+for selection (`--test FROM:TO`). Cross-validation mode: `--months 12
+--start 2025-11-01` simulates every month and scores the genome over 4
+train / test splits (`--folds`); the month score is the gain minus an
+activity penalty (none at 1 – 2 positions per day, `--trades-per-day`; the
+full `--activity-penalty` without any trade) and the fold score subtracts
+the train / test gap (`--gap-weight`); `--test` is then a holdout. The stop-loss
+is a gene. Candles are fetched once (`--candles` /
+`--save` to reuse a CSV);
+prints the best and mean gain per generation and the final population with
+`--genome` lines for `backtest_agent`; every evaluation goes to a history CSV
+(`--history`, default `evolve_history.csv`). All the algorithm settings are
+options (population, generations, elite, mutation rate, sigma min / max,
+crossover, tournament, patience, min improvement, seed), as are the account
+settings (leverage, fee):
+
+**`export_months`** (crate `select`): the training data of the network. Per
+month, the best agent evolved on that month; the month's candles labelled
+with its actions (`buy`, `sell`, `close_*`) and position, its trades, and a
+summary (`months.csv`: score, gain, margin over the best random trader,
+genome):
+
+```sh
+cargo run --release -p select --example export_months -- --candles year.csv --out dataset
+```
+
+**`compare_months`** (crate `select`): per month, the best of N random
+traders vs the best agent evolved with the 15m divergence only and with all
+the rules (same score, same number of tries):
+
+```sh
+cargo run --release -p select --example compare_months -- --candles year.csv
+```
+
+```sh
+cargo run --release -p select --example evolve -- \
+  --train 2026-09-01:2026-10-01 --train 2026-10-01:2026-11-01 \
+  --test 2026-06-01:2026-07-01 --test 2026-07-01:2026-08-01 --combine mean --save data.csv
+cargo run --release -p select --example evolve -- \
+  --months 12 --start 2025-11-01 --test 2026-11-01:2026-11-24 --save year.csv
 ```
 
 ### Chart window
@@ -360,46 +413,68 @@ cargo run --features chart --example chart_signals -- 2 15m
 
 ## Project layout
 
+Cargo workspace; the crates are in `crates/` (see SPECS.md §1 for the
+project goal):
+
 ```text
-src/
-  lib.rs              crate overview
-  graph.rs            Graph builder (typed handles), nodes
-  executor.rs         Executor (ticks), Clock
-  source.rs           Source trait, Mode, Item, Timeframe, aligned schedule
-  source/binance.rs   Binance source (REST)
-  source/merge.rs     merge source (two timeframes)
-  source/mock.rs      mock source
-  candle.rs           Candle (OHLCV)
-  transformer.rs      Transformer trait, Derived
-  transformer/rsi.rs  RSI transformer
-  transformer/ema.rs  EMA transformer
-  transformer/macd.rs MACD transformer
-  transformer/aggregate.rs  aggregation (1m -> 5m, ...)
-  transformer/combine.rs    combined transformer and adapters
-  transformer/trend.rs      trend (close vs EMA)
-  transformer/chart.rs chart transformer + window (feature `chart`)
-  condition.rs        Condition trait
-  condition/divergence.rs  RSI divergence condition
-  condition/patterns.rs    candlestick pattern condition (13 patterns)
-  condition/ema_rules.rs   EMA buy / sell rules
-  condition/filter.rs      trend filter
-  condition/projected.rs   condition on a part of the input (other timeframe)
-  agent.rs            ballots, votes, SendVotes action
-  agent/decision.rs   decision condition (weighted votes)
-  agent/voters.rs     one voter condition per rule
-  trigger.rs          Detection, TriggerEvent
-  action.rs           Action trait, ActionContext, Alert
-  modifier.rs         modifiers and handles
-  error.rs            error types
-examples/             runnable examples (see above)
-  common/             helpers for the flow_* examples and simple
-  support/futures.rs  futures simulation shared by backtest_futures and chart_futures
-tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
-tests/trend_filter.rs trend filter in a graph
-tests/agent.rs        votes triggering the decision in the same tick
-tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
-                      against an independent computation
-tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
+Cargo.toml                 workspace
+crates/trading/            the engine (lib name `trading`)
+  src/
+    lib.rs              crate overview
+    graph.rs            Graph builder (typed handles), nodes
+    executor.rs         Executor (ticks), Clock
+    source.rs           Source trait, Mode, Item, Timeframe, aligned schedule
+    source/binance.rs   Binance source (REST)
+    source/merge.rs     merge source (two timeframes)
+    source/mock.rs      mock source
+    candle.rs           Candle (OHLCV)
+    transformer.rs      Transformer trait, Derived
+    transformer/rsi.rs  RSI transformer
+    transformer/ema.rs  EMA transformer
+    transformer/macd.rs MACD transformer
+    transformer/aggregate.rs  aggregation (1m -> 5m, ...)
+    transformer/combine.rs    combined transformer and adapters
+    transformer/trend.rs      trend (close vs EMA)
+    transformer/chart.rs chart transformer + window (feature `chart`)
+    condition.rs        Condition trait
+    condition/divergence.rs  RSI divergence condition
+    condition/patterns.rs    candlestick pattern condition (13 patterns)
+    condition/ema_rules.rs   EMA buy / sell rules
+    condition/filter.rs      trend filter
+    condition/projected.rs   condition on a part of the input (other timeframe)
+    trigger.rs          Detection, TriggerEvent
+    action.rs           Action trait, ActionContext, Alert
+    modifier.rs         modifiers and handles
+    error.rs            error types
+  examples/             runnable examples (see above)
+    common/             helpers for the flow_* examples and simple
+    support/futures.rs  futures simulation of backtest_futures and chart_futures
+  tests/executor.rs     executor tests (tick order, modes, bootstrap length, modifiers, determinism)
+  tests/trend_filter.rs trend filter in a graph
+crates/agent/              the multi-rule agent
+  src/lib.rs            ballots, votes, SendVotes action
+  src/decision.rs       decision condition (weighted votes)
+  src/voters.rs         one voter condition per rule
+  src/account.rs        simulated futures account
+  src/candles.rs        candles: fetch from Binance once, CSV read / write
+  src/dataset.rs        candles labelled with an agent's trades (training data)
+  src/genome.rs         genome (26 genes) <-> AgentParams
+  src/simulate.rs       simulate: the fitness of a genome
+  examples/backtest_agent.rs  test agent on the futures simulation
+  tests/agent.rs        votes triggering the decision in the same tick
+  tests/agent_votes.rs  agent on 2 months of real SOL/USDT 15m candles: every vote checked
+                        against an independent computation
+  tests/simulate.rs     simulations on the same candles: accounting, determinism, errors
+  tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
+crates/select/             evolutionary search of agent genomes
+  src/lib.rs            evolve: the genetic algorithm, history
+  src/rng.rs            deterministic random generator (SplitMix64)
+  src/score.rs          month score (activity), train / test folds, cross score
+  src/baseline.rs       random trader (baseline)
+  src/month.rs          one month: best evolved agent, best random trader
+  examples/evolve.rs    evolution of agents on SOL/USDT 15m (periods, cross-validation)
+  examples/compare_months.rs  per month: random traders vs evolved agents
+  examples/export_months.rs   training data: labelled candles per month
 ```
 
 ---
@@ -409,10 +484,10 @@ tests/data/           test data (Binance SOL/USDT 15m candles, CSV)
 All four commands must pass before a change is done:
 
 ```sh
-cargo build
-cargo test                      # add --features chart to include the chart tests
+cargo build --workspace --all-targets
+cargo test --workspace                     # add --features trading/chart for the chart tests
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings   # also with --features chart
+cargo clippy --workspace --all-targets -- -D warnings   # also with --features trading/chart
 ```
 
 Automated tests never use the network: they use `MockSource`, hand-made
