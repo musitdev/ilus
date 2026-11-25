@@ -3,10 +3,12 @@
 //! ```text
 //! candles 15m (memory) ─┬─> Decision ──> SimAccount (sends Closed on stop / liquidation)
 //!                       ├─> Rsi ─> DivergenceVoter 15m ─> SendVotes
-//!                       ├─> Aggregate 1h ─> OnValue(Rsi) ─> Projected(DivergenceVoter 1h) ─> SendVotes
 //!                       ├─> Combine(Ema fast, Ema slow) ─> EmaCrossVoter ─> SendVotes
 //!                       ├─> Trend(EMA n) ─> TrendVoter ─> SendVotes
-//!                       └─> PatternVoter (13 patterns) ─> SendVotes
+//!                       ├─> PatternVoter (13 patterns) ─> SendVotes
+//!                       ├─> VolumeMean(N) ─> VolumeSpikeVoter(k) ─> SendVotes
+//!                       ├─> ObvEma(n) ─> EmaCrossVoter (OBV x its EMA) ─> SendVotes
+//!                       └─> Obv ─> DivergenceVoter (price / OBV, any level) ─> SendVotes
 //! ```
 //!
 //! The candles are given by the caller (loaded once, e.g. from Binance or a
@@ -25,24 +27,24 @@ use rust_decimal::Decimal;
 use crate::account::{Account, AccountParams, AccountSummary};
 use crate::decision::{Decision, DecisionEvent, DecisionKind};
 use crate::genome::{AgentParams, DivergenceGenes, GenomeError};
-use crate::voters::{DivergenceVoter, EmaCrossVoter, PatternVoter, TrendVoter};
+use crate::voters::{DivergenceVoter, EmaCrossVoter, PatternVoter, TrendVoter, VolumeSpikeVoter};
 use crate::{DecisionModifier, SendVotes, Weights};
 use trading::action::{Action, ActionContext};
 use trading::candle::Candle;
 use trading::condition::divergence::DivergenceParams;
 use trading::condition::patterns::{PatternCondition, ThresholdSet};
-use trading::condition::projected::{Projected, aggregated};
+use trading::condition::volume::VolumeSpike;
 use trading::error::ActionError;
 use trading::executor::{Clock, Executor};
 use trading::graph::Graph;
 use trading::modifier::ModifierHandle;
 use trading::source::Timeframe;
 use trading::source::mock::MockSource;
-use trading::transformer::aggregate::Aggregate;
-use trading::transformer::combine::{Combine, OnValue};
+use trading::transformer::combine::Combine;
 use trading::transformer::ema::Ema;
 use trading::transformer::rsi::Rsi;
 use trading::transformer::trend::Trend;
+use trading::transformer::volume::{Obv, ObvEma, VolumeMean};
 use trading::trigger::TriggerEvent;
 
 /// RSI period of the divergences (fixed).
@@ -122,13 +124,15 @@ fn invalid(e: impl fmt::Display) -> SimError {
 }
 
 /// Candles needed before `from` so that every rule is warm when trading
-/// starts (the 1h chain counts in 1h candles).
+/// starts.
 pub fn history_needed(p: &AgentParams) -> usize {
     let pivots = PIVOT_SIDE + 1 + PIVOT_SIDE;
     let patterns = ThresholdSet::default();
     [
         RSI_PERIOD + 1 + pivots,
-        4 * (RSI_PERIOD + 1 + pivots) + 4,
+        1 + pivots, // OBV divergence
+        p.spike_period + 2,
+        p.obv_ema + 1,
         p.ema_slow + 1,
         p.trend_period + 1,
         patterns.avg_len.max(patterns.trend_len) + 3,
@@ -250,6 +254,18 @@ fn divergence(r: &DivergenceGenes, timeframe: Timeframe) -> Result<DivergenceVot
     DivergenceVoter::new(params, r.exit_rsi_high, r.exit_rsi_low).map_err(invalid)
 }
 
+/// OBV divergence: any level (the OBV has no 30 / 70), no exit.
+fn obv_divergence(lookahead: usize) -> Result<DivergenceVoter, SimError> {
+    let params = DivergenceParams {
+        left: PIVOT_SIDE,
+        right: PIVOT_SIDE,
+        min_gap: Timeframe::M15.duration() * 2,
+        lookahead,
+        ..DivergenceParams::default()
+    };
+    DivergenceVoter::indicator(params).map_err(invalid)
+}
+
 fn send<I>(rule: &str, w: Weights, to: ModifierHandle<DecisionModifier>) -> SendVotes<I> {
     SendVotes::new(rule, w, to)
 }
@@ -280,18 +296,6 @@ fn build(
     let v = g.condition("div-15m", divergence(&p.div15_rule, Timeframe::M15)?, &rsi);
     g.action(send("div-15m", p.div15, to), &v);
 
-    let h1 = g.transform(
-        Aggregate::new(Timeframe::M15, Timeframe::H1).map_err(invalid)?,
-        src,
-    );
-    let h1_rsi = g.transform(OnValue::new(Rsi::new(RSI_PERIOD).map_err(invalid)?), &h1);
-    let voter = Projected::new(
-        divergence(&p.div1h_rule, Timeframe::H1)?,
-        aggregated::<Decimal>,
-    );
-    let v = g.condition("div-1h", voter, &h1_rsi);
-    g.action(send("div-1h", p.div1h, to), &v);
-
     let emas = g.transform(
         Combine::new((
             Ema::new(p.ema_fast).map_err(invalid)?,
@@ -310,5 +314,18 @@ fn build(
         PatternVoter::new(PatternCondition::new(ThresholdSet::default()).map_err(invalid)?);
     let v = g.condition("patterns", patterns, src);
     g.action(send("patterns", p.patterns, to), &v);
+
+    let mean = g.transform(VolumeMean::new(p.spike_period).map_err(invalid)?, src);
+    let spike = VolumeSpikeVoter::new(VolumeSpike::new(p.spike_factor).map_err(invalid)?);
+    let v = g.condition("spike", spike, &mean);
+    g.action(send("spike", p.spike, to), &v);
+
+    let obv_ema = g.transform(ObvEma::new(p.obv_ema).map_err(invalid)?, src);
+    let v = g.condition("obv-cross", EmaCrossVoter::default(), &obv_ema);
+    g.action(send("obv-cross", p.obv_cross, to), &v);
+
+    let obv = g.transform(Obv::default(), src);
+    let v = g.condition("obv-div", obv_divergence(p.obv_lookahead)?, &obv);
+    g.action(send("obv-div", p.obv_div, to), &v);
     Ok(())
 }

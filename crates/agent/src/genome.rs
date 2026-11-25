@@ -7,7 +7,8 @@
 //! - Genes outside [0, 1] are clamped (a mutation cannot make a genome
 //!   invalid); NaN is rejected.
 //! - Fixed (not genes): RSI 14, pivots `left` / `right` 3, the divergence
-//!   `min_gap` (2 candles of its timeframe), the pattern thresholds.
+//!   `min_gap` (2 candles), the pattern thresholds; the OBV divergence has
+//!   no level and no exit (any pivot, exits by the other rules).
 
 use std::fmt;
 
@@ -44,39 +45,43 @@ const W: (Decimal, Decimal, Decimal) = (dec!(0), dec!(5), dec!(0.25));
 const T: (Decimal, Decimal, Decimal) = (dec!(0.25), dec!(10), dec!(0.25));
 
 /// The genes, in genome order.
-pub const GENES: [Gene; 26] = [
-    // Weights (open / exit) of the five rules.
+pub const GENES: [Gene; 29] = [
+    // Weights (open / exit) of the seven rules.
     gene("div15.open_weight", W.0, W.1, W.2),
     gene("div15.exit_weight", W.0, W.1, W.2),
-    gene("div1h.open_weight", W.0, W.1, W.2),
-    gene("div1h.exit_weight", W.0, W.1, W.2),
     gene("ema.open_weight", W.0, W.1, W.2),
     gene("ema.exit_weight", W.0, W.1, W.2),
     gene("trend.open_weight", W.0, W.1, W.2),
     gene("trend.exit_weight", W.0, W.1, W.2),
     gene("patterns.open_weight", W.0, W.1, W.2),
     gene("patterns.exit_weight", W.0, W.1, W.2),
+    gene("spike.open_weight", W.0, W.1, W.2),
+    gene("spike.exit_weight", W.0, W.1, W.2),
+    gene("obv_cross.open_weight", W.0, W.1, W.2),
+    gene("obv_cross.exit_weight", W.0, W.1, W.2),
+    gene("obv_div.open_weight", W.0, W.1, W.2),
+    gene("obv_div.exit_weight", W.0, W.1, W.2),
     // Decision thresholds.
     gene("open_threshold", T.0, T.1, T.2),
     gene("exit_threshold", T.0, T.1, T.2),
-    // 15m divergence.
+    // 15m RSI divergence.
     gene("div15.rsi_low", dec!(20), dec!(50), dec!(1)),
     gene("div15.rsi_high", dec!(50), dec!(80), dec!(1)),
     gene("div15.lookahead", dec!(1), dec!(6), dec!(1)),
     gene("div15.exit_rsi_high", dec!(60), dec!(90), dec!(1)),
     gene("div15.exit_rsi_low", dec!(10), dec!(40), dec!(1)),
-    // 1h divergence.
-    gene("div1h.rsi_low", dec!(20), dec!(50), dec!(1)),
-    gene("div1h.rsi_high", dec!(50), dec!(80), dec!(1)),
-    gene("div1h.lookahead", dec!(1), dec!(6), dec!(1)),
-    gene("div1h.exit_rsi_high", dec!(60), dec!(90), dec!(1)),
-    gene("div1h.exit_rsi_low", dec!(10), dec!(40), dec!(1)),
     // EMAs: the slow period is the fast one plus a gap (always slower).
     gene("ema.fast", dec!(5), dec!(50), dec!(1)),
     gene("ema.slow_gap", dec!(1), dec!(150), dec!(1)),
     gene("trend.period", dec!(20), dec!(300), dec!(1)),
     // Account: stop-loss in % of the entry price.
     gene("stop_pct", dec!(1), dec!(10), dec!(0.5)),
+    // Volume spike: mean over N candles, factor k.
+    gene("spike.period", dec!(5), dec!(100), dec!(1)),
+    gene("spike.factor", dec!(1.5), dec!(5), dec!(0.25)),
+    // OBV: EMA period of the cross, lookahead of the divergence.
+    gene("obv_cross.ema", dec!(5), dec!(100), dec!(1)),
+    gene("obv_div.lookahead", dec!(1), dec!(6), dec!(1)),
 ];
 
 /// Number of genes.
@@ -102,20 +107,22 @@ pub struct DivergenceGenes {
 pub struct AgentParams {
     /// 15m divergence weights.
     pub div15: Weights,
-    /// 1h divergence weights.
-    pub div1h: Weights,
     /// EMA cross weights.
     pub ema: Weights,
     /// Trend weights.
     pub trend: Weights,
     /// Candlestick patterns weights.
     pub patterns: Weights,
+    /// Volume spike weights.
+    pub spike: Weights,
+    /// OBV cross weights.
+    pub obv_cross: Weights,
+    /// OBV divergence weights.
+    pub obv_div: Weights,
     /// Decision thresholds.
     pub decision: DecisionParams,
     /// 15m divergence parameters.
     pub div15_rule: DivergenceGenes,
-    /// 1h divergence parameters.
-    pub div1h_rule: DivergenceGenes,
     /// Fast EMA period.
     pub ema_fast: usize,
     /// Slow EMA period (> fast).
@@ -124,6 +131,14 @@ pub struct AgentParams {
     pub trend_period: usize,
     /// Stop-loss in % of the entry price.
     pub stop_pct: Decimal,
+    /// Volume spike: candles of the mean volume.
+    pub spike_period: usize,
+    /// Volume spike: factor over the mean.
+    pub spike_factor: Decimal,
+    /// EMA period of the OBV cross.
+    pub obv_ema: usize,
+    /// Lookahead of the OBV divergence.
+    pub obv_lookahead: usize,
 }
 
 /// Why a genome cannot be decoded.
@@ -205,23 +220,28 @@ impl AgentParams {
             exit_rsi_high: v[i + 3],
             exit_rsi_low: v[i + 4],
         };
-        let ema_fast = count(v[22]);
+        let ema_fast = count(v[21]);
         Ok(Self {
             div15: w(0),
-            div1h: w(2),
-            ema: w(4),
-            trend: w(6),
-            patterns: w(8),
+            ema: w(2),
+            trend: w(4),
+            patterns: w(6),
+            spike: w(8),
+            obv_cross: w(10),
+            obv_div: w(12),
             decision: DecisionParams {
-                open_threshold: v[10],
-                exit_threshold: v[11],
+                open_threshold: v[14],
+                exit_threshold: v[15],
             },
-            div15_rule: div(12),
-            div1h_rule: div(17),
+            div15_rule: div(16),
             ema_fast,
-            ema_slow: ema_fast + count(v[23]),
-            trend_period: count(v[24]),
-            stop_pct: v[25],
+            ema_slow: ema_fast + count(v[22]),
+            trend_period: count(v[23]),
+            stop_pct: v[24],
+            spike_period: count(v[25]),
+            spike_factor: v[26],
+            obv_ema: count(v[27]),
+            obv_lookahead: count(v[28]),
         })
     }
 
@@ -241,25 +261,32 @@ impl AgentParams {
         let values: Vec<Decimal> = [
             self.div15.open,
             self.div15.exit,
-            self.div1h.open,
-            self.div1h.exit,
             self.ema.open,
             self.ema.exit,
             self.trend.open,
             self.trend.exit,
             self.patterns.open,
             self.patterns.exit,
+            self.spike.open,
+            self.spike.exit,
+            self.obv_cross.open,
+            self.obv_cross.exit,
+            self.obv_div.open,
+            self.obv_div.exit,
             self.decision.open_threshold,
             self.decision.exit_threshold,
         ]
         .into_iter()
         .chain(div(&self.div15_rule))
-        .chain(div(&self.div1h_rule))
         .chain([
             d(self.ema_fast),
             d(self.ema_slow.saturating_sub(self.ema_fast)),
             d(self.trend_period),
             self.stop_pct,
+            d(self.spike_period),
+            self.spike_factor,
+            d(self.obv_ema),
+            d(self.obv_lookahead),
         ])
         .collect();
         GENES.iter().zip(values).map(|(g, v)| g.encode(v)).collect()
@@ -277,21 +304,27 @@ impl fmt::Display for AgentParams {
         };
         write!(
             f,
-            "weights open/exit: div15 {}, div1h {}, ema {}, trend {}, patterns {}; \
-             thresholds open {} exit {}; div15 {}; div1h {}; EMA {}/{}; trend EMA {}; stop {}%",
+            "weights open/exit: div15 {}, ema {}, trend {}, patterns {}, spike {}, obv cross {}, obv div {}; \
+             thresholds open {} exit {}; div15 {}; EMA {}/{}; trend EMA {}; stop {}%; \
+             spike {} x {}; OBV EMA {}, OBV lookahead {}",
             w(&self.div15),
-            w(&self.div1h),
             w(&self.ema),
             w(&self.trend),
             w(&self.patterns),
+            w(&self.spike),
+            w(&self.obv_cross),
+            w(&self.obv_div),
             self.decision.open_threshold.normalize(),
             self.decision.exit_threshold.normalize(),
             d(&self.div15_rule),
-            d(&self.div1h_rule),
             self.ema_fast,
             self.ema_slow,
             self.trend_period,
-            self.stop_pct.normalize()
+            self.stop_pct.normalize(),
+            self.spike_period,
+            self.spike_factor.normalize(),
+            self.obv_ema,
+            self.obv_lookahead
         )
     }
 }
@@ -309,11 +342,15 @@ mod tests {
         assert_eq!(min.div15_rule.lookahead, 1);
         assert_eq!((min.ema_fast, min.ema_slow, min.trend_period), (5, 6, 20));
         assert_eq!(min.stop_pct, dec!(1));
+        assert_eq!((min.spike_period, min.spike_factor), (5, dec!(1.5)));
+        assert_eq!((min.obv_ema, min.obv_lookahead), (5, 1));
         let max = AgentParams::decode(&[1.0; GENOME_LEN]).unwrap();
         assert_eq!(max.patterns.exit, dec!(5));
         assert_eq!(max.decision.exit_threshold, dec!(10));
-        assert_eq!(max.div1h_rule.exit_rsi_high, dec!(90));
-        assert_eq!(max.div1h_rule.lookahead, 6);
+        assert_eq!(max.div15_rule.exit_rsi_high, dec!(90));
+        assert_eq!(max.div15_rule.lookahead, 6);
+        assert_eq!((max.spike_period, max.spike_factor), (100, dec!(5)));
+        assert_eq!((max.obv_ema, max.obv_lookahead), (100, 6));
         assert_eq!(
             (max.ema_fast, max.ema_slow, max.trend_period),
             (50, 200, 300)

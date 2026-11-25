@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use agent::decision::{Decision, DecisionEvent, DecisionParams};
-use agent::voters::{DivergenceVoter, EmaCrossVoter, PatternVoter, TrendVoter};
+use agent::voters::{DivergenceVoter, EmaCrossVoter, PatternVoter, TrendVoter, VolumeSpikeVoter};
 use agent::{Ballot, DecisionModifier, SendVotes, Side, Weights};
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -26,6 +26,7 @@ use trading::candle::Candle;
 use trading::condition::divergence::DivergenceParams;
 use trading::condition::patterns::{PatternCondition, ThresholdSet};
 use trading::condition::projected::{Projected, aggregated};
+use trading::condition::volume::VolumeSpike;
 use trading::condition::{Condition, Signal};
 use trading::error::ModifierError;
 use trading::executor::{Clock, Executor};
@@ -38,12 +39,21 @@ use trading::transformer::combine::{Combine, OnValue};
 use trading::transformer::ema::Ema;
 use trading::transformer::rsi::Rsi;
 use trading::transformer::trend::Trend;
+use trading::transformer::volume::{Obv, ObvEma, VolumeMean};
 use trading::trigger::Detection;
 
 const DATA: &str = include_str!("data/solusdt_15m_2026-09-24_2026-11-24.csv");
 const BOOTSTRAP: usize = 104;
 const EXIT_HIGH: Decimal = dec!(75);
 const EXIT_LOW: Decimal = dec!(30);
+const SPIKE_PERIOD: usize = 20;
+const SPIKE_FACTOR: Decimal = dec!(3);
+const OBV_EMA: usize = 20;
+
+/// OBV divergence: lookahead 3 (levels ignored, no exit).
+fn obv_params() -> DivergenceParams {
+    div_params(Timeframe::M15)
+}
 
 /// One recorded vote: (candle time, ballot, weight).
 type Votes = BTreeMap<String, Vec<(DateTime<Utc>, Ballot, Decimal)>>;
@@ -72,6 +82,9 @@ fn weights(rule: &str) -> Weights {
         "div-1h" => (dec!(3), dec!(1.5)),
         "ema-9-21" => (dec!(1), dec!(0.75)),
         "trend-50" => (dec!(1.25), dec!(0.5)),
+        "spike" => (dec!(1.5), dec!(0.25)),
+        "obv-cross" => (dec!(0.6), dec!(0.9)),
+        "obv-div" => (dec!(2.5), dec!(0.1)),
         _ => (dec!(0.8), dec!(0.4)),
     };
     Weights { open, exit }
@@ -181,6 +194,20 @@ fn run_graph(candles: Vec<Candle>) -> (Votes, DateTime<Utc>) {
     let v = g.condition("patterns", patterns, &sol);
     g.action(send(to, "patterns"), &v);
 
+    let mean = g.transform(VolumeMean::new(SPIKE_PERIOD).unwrap(), &sol);
+    let spike = VolumeSpikeVoter::new(VolumeSpike::new(SPIKE_FACTOR).unwrap());
+    let v = g.condition("spike", spike, &mean);
+    g.action(send(to, "spike"), &v);
+
+    let obv_ema = g.transform(ObvEma::new(OBV_EMA).unwrap(), &sol);
+    let v = g.condition("obv-cross", EmaCrossVoter::default(), &obv_ema);
+    g.action(send(to, "obv-cross"), &v);
+
+    let obv = g.transform(Obv::default(), &sol);
+    let voter = DivergenceVoter::indicator(obv_params()).unwrap();
+    let v = g.condition("obv-div", voter, &obv);
+    g.action(send(to, "obv-div"), &v);
+
     Executor::new(g)
         .with_clock(Clock::Simulated(DateTime::<Utc>::UNIX_EPOCH))
         .run()
@@ -262,12 +289,13 @@ struct Search {
 
 impl Search {
     /// `lows`: bullish side. Returns B if `b` diverges from A.
-    fn pivot(&mut self, b: P, lows: bool, p: &DivergenceParams) -> Option<P> {
-        let valid = if lows {
-            b.rsi <= p.rsi_low
-        } else {
-            b.rsi >= p.rsi_high
-        };
+    fn pivot(&mut self, b: P, lows: bool, p: &DivergenceParams, levels: bool) -> Option<P> {
+        let valid = !levels
+            || if lows {
+                b.rsi <= p.rsi_low
+            } else {
+                b.rsi >= p.rsi_high
+            };
         if let Some(a) = self.a {
             self.seen += 1;
             let diverges = if lows {
@@ -300,7 +328,13 @@ impl Search {
 }
 
 /// Ballots of the divergence voter for each bar of `bars` (index = bar).
-fn ref_divergence(bars: &[Bar], p: &DivergenceParams) -> Vec<Vec<Ballot>> {
+/// `exits`: the RSI exit levels (high, low); `None` for an indicator without
+/// levels: any pivot can start a divergence, and no exit.
+fn ref_divergence(
+    bars: &[Bar],
+    p: &DivergenceParams,
+    exits: Option<(Decimal, Decimal)>,
+) -> Vec<Vec<Ballot>> {
     let (l, r) = (p.left, p.right);
     let mut out = vec![Vec::new(); bars.len()];
     let (mut lows, mut highs) = (Search::default(), Search::default());
@@ -330,8 +364,9 @@ fn ref_divergence(bars: &[Bar], p: &DivergenceParams) -> Vec<Vec<Ballot>> {
                 }
             }
         }
-        let bull = low.and_then(|b| lows.pivot(b, true, p));
-        let bear = high.and_then(|b| highs.pivot(b, false, p));
+        let levels = exits.is_some();
+        let bull = low.and_then(|b| lows.pivot(b, true, p, levels));
+        let bear = high.and_then(|b| highs.pivot(b, false, p, levels));
         let ballots = &mut out[at];
         match (bull, bear) {
             (Some(b), _) => {
@@ -355,11 +390,13 @@ fn ref_divergence(bars: &[Bar], p: &DivergenceParams) -> Vec<Vec<Ballot>> {
                 }
             }
         }
-        if high.is_some_and(|h| h.rsi > EXIT_HIGH) {
-            ballots.push(Ballot::Exit(Side::Long));
-        }
-        if low.is_some_and(|h| h.rsi < EXIT_LOW) {
-            ballots.push(Ballot::Exit(Side::Short));
+        if let Some((hi, lo)) = exits {
+            if high.is_some_and(|h| h.rsi > hi) {
+                ballots.push(Ballot::Exit(Side::Long));
+            }
+            if low.is_some_and(|h| h.rsi < lo) {
+                ballots.push(Ballot::Exit(Side::Short));
+            }
         }
     }
     out
@@ -484,6 +521,69 @@ fn ref_patterns(candles: &[Candle]) -> Vec<Vec<Ballot>> {
         .collect()
 }
 
+/// On-Balance Volume: 0 at the first candle, then ± the volume when the
+/// close is above / below the previous one.
+fn ref_obv(candles: &[Candle]) -> Vec<Decimal> {
+    let mut out = Vec::with_capacity(candles.len());
+    let mut obv = Decimal::ZERO;
+    for (i, c) in candles.iter().enumerate() {
+        if i > 0 {
+            let prev = candles[i - 1].close;
+            obv += match c.close.cmp(&prev) {
+                std::cmp::Ordering::Greater => c.volume,
+                std::cmp::Ordering::Less => -c.volume,
+                std::cmp::Ordering::Equal => Decimal::ZERO,
+            };
+        }
+        out.push(obv);
+    }
+    out
+}
+
+/// Ballots of the volume spike voter: volume > factor × the mean of the
+/// previous `SPIKE_PERIOD` volumes, on a green / red candle; revoked when the
+/// close breaks the spike candle's low / high.
+fn ref_spike(candles: &[Candle]) -> Vec<Vec<Ballot>> {
+    let n = SPIKE_PERIOD;
+    let mut active: Option<(Side, Decimal)> = None;
+    (0..candles.len())
+        .map(|i| {
+            let c = &candles[i];
+            let spike = if i >= n {
+                let mean = candles[i - n..i].iter().map(|k| k.volume).sum::<Decimal>()
+                    / Decimal::from(n as u64);
+                c.volume > SPIKE_FACTOR * mean
+            } else {
+                false
+            };
+            let side = match c.close.cmp(&c.open) {
+                std::cmp::Ordering::Greater => Some(Side::Long),
+                std::cmp::Ordering::Less => Some(Side::Short),
+                std::cmp::Ordering::Equal => None,
+            };
+            if let (true, Some(s)) = (spike, side) {
+                active = Some((s, if s == Side::Long { c.low } else { c.high }));
+                let other = if s == Side::Long {
+                    Side::Short
+                } else {
+                    Side::Long
+                };
+                return vec![Ballot::Open(s), Ballot::Exit(other)];
+            }
+            let broken = match active {
+                Some((Side::Long, low)) => c.close < low,
+                Some((Side::Short, high)) => c.close > high,
+                None => false,
+            };
+            if broken {
+                active = None;
+                return vec![Ballot::Revoke];
+            }
+            Vec::new()
+        })
+        .collect()
+}
+
 /// The expected votes of every rule, from the 15m candle `from` on (the
 /// earlier ones are bootstrap candles: no action, no vote).
 fn reference(candles: &[Candle], from: usize) -> Votes {
@@ -505,7 +605,11 @@ fn reference(candles: &[Candle], from: usize) -> Votes {
     let mut per_rule: BTreeMap<&str, Vec<Vec<Ballot>>> = BTreeMap::new();
     per_rule.insert(
         "div-15m",
-        ref_divergence(&bars, &div_params(Timeframe::M15)),
+        ref_divergence(
+            &bars,
+            &div_params(Timeframe::M15),
+            Some((EXIT_HIGH, EXIT_LOW)),
+        ),
     );
 
     // 1h: the hours with an RSI (the voter only sees those), each one at
@@ -532,9 +636,13 @@ fn reference(candles: &[Candle], from: usize) -> Votes {
         })
         .unzip();
     let mut h1 = vec![Vec::new(); candles.len()];
-    for (k, ballots) in ref_divergence(&h_bars, &div_params(Timeframe::H1))
-        .into_iter()
-        .enumerate()
+    for (k, ballots) in ref_divergence(
+        &h_bars,
+        &div_params(Timeframe::H1),
+        Some((EXIT_HIGH, EXIT_LOW)),
+    )
+    .into_iter()
+    .enumerate()
     {
         h1[h_at[k]] = ballots;
     }
@@ -546,6 +654,24 @@ fn reference(candles: &[Candle], from: usize) -> Votes {
     );
     per_rule.insert("trend-50", ref_trend(&closes, &ref_ema(&closes, 50)));
     per_rule.insert("patterns", ref_patterns(candles));
+
+    // Volume rules.
+    per_rule.insert("spike", ref_spike(candles));
+    let obv = ref_obv(candles);
+    let obv_some: Vec<Option<Decimal>> = obv.iter().copied().map(Some).collect();
+    per_rule.insert("obv-cross", ref_cross(&obv_some, &ref_ema(&obv, OBV_EMA)));
+    let obv_bars: Vec<Bar> = candles
+        .iter()
+        .zip(&obv)
+        .map(|(c, &o)| Bar {
+            time: c.open_time,
+            low: c.low,
+            high: c.high,
+            close: c.close,
+            rsi: Some(o),
+        })
+        .collect();
+    per_rule.insert("obv-div", ref_divergence(&obv_bars, &obv_params(), None));
 
     let mut votes = Votes::new();
     for (rule, per_candle) in per_rule {

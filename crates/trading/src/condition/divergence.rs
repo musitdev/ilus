@@ -227,6 +227,9 @@ pub struct RsiDivergence {
     pivots: Pivots,
     lows: Search,
     highs: Search,
+    /// `false`: any pivot can be the first one (indicators without levels,
+    /// e.g. the OBV); `rsi_low` / `rsi_high` are ignored.
+    levels: bool,
 }
 
 impl RsiDivergence {
@@ -250,12 +253,28 @@ impl RsiDivergence {
         Ok(Self::unchecked(params))
     }
 
+    /// Divergences of the price with an indicator that has no levels (e.g.
+    /// the OBV): any pivot can be the first one; `rsi_low` / `rsi_high` are
+    /// ignored. The other checks of [`new`](Self::new) apply.
+    pub fn any_level(params: DivergenceParams) -> Result<Self, ParameterError> {
+        let checked = DivergenceParams {
+            rsi_low: Decimal::ONE_HUNDRED,
+            rsi_high: Decimal::ZERO,
+            ..params
+        };
+        Ok(Self {
+            levels: false,
+            ..Self::new(checked)?
+        })
+    }
+
     fn unchecked(params: DivergenceParams) -> Self {
         Self {
             params,
             pivots: Pivots::new(params.left, params.right),
             lows: Search::default(),
             highs: Search::default(),
+            levels: true,
         }
     }
 
@@ -275,13 +294,13 @@ impl RsiDivergence {
             match kind {
                 DivergenceKind::Bullish => (
                     &mut self.lows,
-                    b.rsi <= p.rsi_low,
+                    !self.levels || b.rsi <= p.rsi_low,
                     |a, b| b.price < a.price && b.rsi > a.rsi,
                     |a, b| b.rsi < a.rsi,
                 ),
                 DivergenceKind::Bearish => (
                     &mut self.highs,
-                    b.rsi >= p.rsi_high,
+                    !self.levels || b.rsi >= p.rsi_high,
                     |a, b| b.price > a.price && b.rsi < a.rsi,
                     |a, b| b.rsi > a.rsi,
                 ),
@@ -612,5 +631,31 @@ mod tests {
             .filter_map(|it| pivots.push(it).high)
             .count();
         assert_eq!(highs, 1);
+    }
+
+    #[test]
+    fn any_level_for_indicators_without_levels() {
+        // OBV-like values: lower low with a higher indicator (5000 -> 6000).
+        let items = valleys(&[(100, 5000), (98, 6000)]);
+        let count = |mut c: RsiDivergence| {
+            items
+                .iter()
+                .filter_map(|data| {
+                    c.on_data(Item {
+                        data,
+                        mode: Mode::Replay,
+                    })
+                })
+                .count()
+        };
+        // With the RSI levels (30 / 70), 5000 is never a valid first low.
+        assert_eq!(count(RsiDivergence::new(params()).unwrap()), 0);
+        assert_eq!(count(RsiDivergence::any_level(params()).unwrap()), 1);
+        // The other checks still apply.
+        let bad = DivergenceParams {
+            lookahead: 0,
+            ..params()
+        };
+        assert!(RsiDivergence::any_level(bad).is_err());
     }
 }

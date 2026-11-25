@@ -6,7 +6,7 @@
 //!   stop-loss drawn in the gene's range), N = the number of genomes the
 //!   "all rules" evolution evaluated that month (the same chances);
 //! - divergence 15m only: evolution with the other rules' weights at 0;
-//! - all rules: evolution with the five rules.
+//! - all rules: evolution with the seven rules.
 //!
 //! `cargo run --release -p select --example compare_months -- --candles year.csv
 //! [--months 12] [--start 2025-11-01] [--population 32] [--generations 30]
@@ -58,8 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?;
     let start: DateTime<Utc> = start.and_hms_opt(0, 0, 0).ok_or("date")?.and_utc();
     let activity = Activity::default();
-    // Weights of div1h, EMA, trend, patterns (genes 2..10): 0 for "divergence only".
-    let div_only: Vec<usize> = (2..10).collect();
+    // Weights of every rule but the 15m divergence (genes 2..14): 0 for
+    // "divergence only".
+    let div_only: Vec<usize> = (2..14).collect();
 
     println!(
         "Per month: best of N random traders vs evolution ({} agents x {} generations), {}x, fee {}%",
